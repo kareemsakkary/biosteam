@@ -19,11 +19,25 @@ D1 = bst.BinaryDistillation(
     outs=('distillate', 'bottoms_product'),
     LHK=('Ethanol', 'Water'), # Light and heavy keys
     y_top=0.79, # Light key composition at the distillate
-    x_bot=0.001, # Light key composition at the bottoms product
+    # x_bot=0.001, # Light key composition at the bottoms product
     k=1.25, # Ratio of actual reflux over minimum reflux
     is_divided=True, # Whether the rectifying and stripping sections are divided
+    N_stages=31, # Number of stages (trays)
 )
+# D1 = bst.BinaryDistillation( 
+#     'D1', ins=feed,
+#     outs=('distillate', 'bottoms_product'),
+#     LHK=('Ethanol', 'Water'), # Light and heavy keys
+#     y_top=0.79, # Light key composition at the distillate
+#     x_bot=0.0001, # Light key composition at the bottoms product
+#     k=1.25, # Ratio of actual reflux over minimum reflux
+#     is_divided=True, # Whether the rectifying and stripping sections are divided
+#     # N_stages=31, # Number of stages (trays)
+# )
 D1.simulate()
 
 D1.diagram(format='png')
 D1.show()
+D1.plot_stages()
+D1.results()
+print(f'Number of stages: {D1.N_stages}')
