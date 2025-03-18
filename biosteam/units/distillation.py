@@ -139,8 +139,6 @@ class RefluxDrum(design.PressureVessel, Unit):
         #: [bool] True if using a mist eliminator pad
         self.has_mist_eliminator = has_mist_eliminator
         
-        self.has_vapor_condenser = False
-        
     def _run(self):
         separations.phase_split(*self.ins, self.outs)
         
@@ -348,36 +346,7 @@ class Distillation(Unit, isabstract=True):
         self.vacuum_system_preference = vacuum_system_preference
         self._load_components(partial_condenser, condenser_thermo, reboiler_thermo)
         self.LHK = LHK
-      
-    def _mass_and_energy_balance_specifications(self):
-        spec = self.product_specification_format
-        specs = []
-        if spec == 'Composition':
-            self._Lr = self._Hr = None
-        elif spec == 'Recovery':
-            self._y_top = self._x_bot = None
-        specs.append( 
-            ('Partial condenser', self._partial_condenser, '-'),
-        )
-        if spec == 'Composition':
-            specs.extend([
-                ('Distillate light key fraction', 100 * self._y_top, '%'),
-                ('Bottoms product heavy key fraction', 100 * self._x_bot, '%'),
-            ])
-        elif spec == 'Recovery':
-            specs.extend([
-                ('Light key recovery', 100 * self._Lr, '%'),
-                ('Heavy key recovery', 100 * self._Hr, '%'),
-            ])
-        else:
-            raise RuntimeError('invalid product specification format')
-        if isinstance(self, ShortcutColumn):
-            return 'Shortcut column', specs
-        elif isinstance(self, BinaryDistillation):
-            return 'Binary distillation', specs
-        else:
-            raise NotImplementedError('unknown name for distillation class')
-            
+        
     def _reset_thermo(self, thermo):
         super()._reset_thermo(thermo)
         self.LHK = self._LHK
@@ -1068,9 +1037,14 @@ class Distillation(Unit, isabstract=True):
         self._cost_vacuum(dimensions)
         
     def _update_equilibrium_variables(self):
-        feed = sum([i.mol for i in self.ins])
-        top = self.outs[0].mol
-        self._distillate_recoveries = (top / feed).to_array()
+        top, bottom = self.outs
+        top = top.mol.to_array()
+        bottom = bottom.mol.to_array()
+        bottom_dummy = bottom.copy()
+        mask = bottom == 0
+        bottom_dummy[mask] = 1e-16
+        self.S = top / bottom_dummy
+        self.S[mask] = inf
 
 
 # %% McCabe-Thiele distillation model utilities
@@ -1551,33 +1525,36 @@ class BinaryDistillation(Distillation, new_graphics=False):
     #         self.K[LK] = Lr / ((1 - Lr) * B)
     #         self.K[HK] = (1 - Hr) / (Hr * B)
 
+    # def _update_composition_parameters(self):
+    #     pass
+
     def _create_material_balance_equations(self, composition_sensitive):
-        split = self._distillate_recoveries
-        fresh_inlets, process_inlets, equations = self._begin_equations(composition_sensitive)
         top, bottom = self.outs
+        S = self.S.copy()
+        fresh_inlets, process_inlets, equations = self._begin_equations(composition_sensitive)
+        top, bottom, *_ = self.outs
         ones = np.ones(self.chemicals.size)
         minus_ones = -ones
         zeros = np.zeros(self.chemicals.size)
         
         # Overall flows
         eq_overall = {}
-        for i in self.outs: 
-            eq_overall[i] = ones
-        for i in process_inlets:
-            if i in eq_overall: del eq_overall[i]
-            else: eq_overall[i] = minus_ones
+        for i in self.outs: eq_overall[i] = ones
+        for i in process_inlets: eq_overall[i] = minus_ones
         equations.append(
             (eq_overall, sum([i.mol for i in fresh_inlets], zeros))
         )
         
-        # Top and bottom flows
+        # Top to bottom flows
         eq_outs = {}
-        minus_split = -split
-        for i in process_inlets: eq_outs[i] = minus_split
-        rhs = split * sum([i.mol for i in fresh_inlets], zeros)
-        eq_outs[top] = ones
+        infmask = ~np.isfinite(S)
+        S[infmask] = 1
+        eq_outs[top] = coef = -ones
+        coef[infmask] = 0
+        eq_outs[bottom] = S
+        
         equations.append(
-            (eq_outs, rhs)
+            (eq_outs, zeros)
         )
         return equations
     
@@ -1592,6 +1569,7 @@ class BinaryDistillation(Distillation, new_graphics=False):
         data = [i.get_data() for i in outs]
         self._run_binary_distillation_mass_balance()
         for i, j in zip(outs, data): i.set_data(j)
+        
 
 # %% Fenske-Underwook-Gilliland distillation model utilities
 
@@ -1879,6 +1857,8 @@ class ShortcutColumn(Distillation, new_graphics=False):
         
         # Remove temporary data
         if composition_spec: self._Lr = self._Hr = None
+        if self.system and self.system.algorithm == 'Phenomena oriented':
+            self._update_equilibrium_variables()
 
     def plot_stages(self):
         raise TypeError('cannot plot stages for shortcut column')
@@ -1978,8 +1958,6 @@ class ShortcutColumn(Distillation, new_graphics=False):
         alpha_mean = compute_mean_volatilities_relative_to_heavy_key(
             K_distillate, K_bottoms, HK_index
         )
-        distillate.T = dp.T
-        bottoms.T = bp.T
         return alpha_mean
         
     def _estimate_distillate_recoveries(self):
@@ -2045,12 +2023,6 @@ class ShortcutColumn(Distillation, new_graphics=False):
     #     bottom[bottom == 0] = 1e-16
     #     self.K = y / x
 
-    def _simulation_error(self):
-        cache = self._distillate_recoveries.copy()
-        error = super()._simulation_error()
-        self._distillate_recoveries = cache
-        return error
-
     def _update_nonlinearities(self):
         mol = sum([i.mol for i in self.outs]).to_array()
         if self.product_specification_format == 'Composition':
@@ -2071,7 +2043,14 @@ class ShortcutColumn(Distillation, new_graphics=False):
             distillate_LHK_mol[mask] = max_flows[mask]
             self._Lr = distillate_LHK_mol[0] / LHK_mol[0]
             self._Hr = distillate_LHK_mol[1] / LHK_mol[1]
-        self._distillate_recoveries = self._estimate_distillate_recoveries()
+        self._distillate_recoveries = split = self._estimate_distillate_recoveries()
+        top = mol * split
+        bottom = mol - top
+        bottom_dummy = bottom.copy()
+        mask = bottom_dummy == 0
+        bottom_dummy[mask] = 1e-16
+        self.S = top / bottom_dummy
+        self.S[mask] = inf
         # s_top, s_bottom = self.outs
         # s_dummy = s_top.copy()
         # s_dummy.mol = top
@@ -2126,12 +2105,12 @@ class AdiabaticMultiStageVLEColumn(MultiStageEquilibrium):
     >>> bst.settings.set_thermo(['AceticAcid', 'EthylAcetate', 'Water', 'MTBE'], cache=True)
     >>> feed = bst.Stream('feed', Water=75, AceticAcid=5, MTBE=20, T=320)
     >>> steam = bst.Stream('steam', Water=100, phase='g', T=390)
-    >>> stripper = bst.Stripper(None,
+    >>> absorber = bst.Absorber(None,
     ...     N_stages=2, ins=[feed, steam], 
     ...     solute="AceticAcid", outs=['vapor', 'liquid']
     ... )
-    >>> stripper.simulate()
-    >>> stripper.show()
+    >>> absorber.simulate()
+    >>> absorber.show()
     AdiabaticMultiStageVLEColumn
     ins...
     [0] feed  
@@ -2155,7 +2134,7 @@ class AdiabaticMultiStageVLEColumn(MultiStageEquilibrium):
                         MTBE        0.00031
     
     >>> absorber.results()
-    Stripper                                   Units         
+    Absorber                                   Units         
     Design              Theoretical stages                  2
                         Actual stages                       4
                         Height                    ft     19.9
@@ -2204,7 +2183,6 @@ class AdiabaticMultiStageVLEColumn(MultiStageEquilibrium):
             vapor_side_draws=None,
             liquid_side_draws=None,
             P=101325,  
-            T=None,
             partition_data=None, 
             vessel_material='Carbon steel',
             tray_material='Carbon steel',
@@ -2225,7 +2203,7 @@ class AdiabaticMultiStageVLEColumn(MultiStageEquilibrium):
                       bottom_side_draws=liquid_side_draws,
                       partition_data=partition_data,
                       phases=("g", "l"), collapsed_init=collapsed_init,
-                      P=P, T=T, use_cache=use_cache, method=method)
+                      P=P, use_cache=use_cache, method=method)
        
         # Construction specifications
         self.solute = solute
@@ -2309,10 +2287,10 @@ class AdiabaticMultiStageVLEColumn(MultiStageEquilibrium):
         index = IDs.index(solute)
         K = gmean([i.partition.K[index] for i in stages])
         if self.liquid.imol[solute] > self.vapor.imol[solute]:
-            self.line = "Absorber"
+            self.line = "Stripper"
             alpha = 1 / K
         else:
-            self.line = "Stripper"
+            self.line = "Absorber"
             alpha = K
         return alpha
        

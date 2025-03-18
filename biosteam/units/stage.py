@@ -21,7 +21,6 @@ import pandas as pd
 from scipy.optimize import minimize, differential_evolution
 from math import inf
 from typing import Callable
-from copy import copy
 from scipy.optimize import root
 from ..exceptions import Converged
 from .. import Unit
@@ -83,22 +82,6 @@ class SinglePhaseStage(Unit):
         self.Q = Q
         self.P = P
         self.phase = phase
-        
-    def _mass_and_energy_balance_specifications(self):
-        specs = [('phase', self.phase, '-')]
-        if self.T is not None: 
-            specs.append(
-                ('T', self.T, 'K')
-            )
-        if self.Q is not None:
-            specs.append(
-                ('Q', self.Q, 'kJ/hr')
-            )
-        if self.P is not None:
-            specs.append(
-                ('P', self.P, 'Pa')
-            )
-        return self.line, specs
         
     def _run(self):
         outlet = self.outs[0]
@@ -166,8 +149,6 @@ class ReactivePhaseStage(bst.Unit): # Does not include VLE
         self.P = P
         self.Q = Q
         self.phase = phase
-        
-    _mass_and_energy_balance_specifications = SinglePhaseStage._mass_and_energy_balance_specifications
         
     def _run(self):
         feed = self.ins[0]
@@ -298,30 +279,6 @@ class StageEquilibrium(Unit):
                 split=bottom_split, 
             )
         self.set_specification(B, Q, T, P)
-    
-    def _mass_and_energy_balance_specifications(self):
-        specs = []
-        if self.phases is not None:
-            specs.append(
-                ('Phases', self.phases, '-')
-            )
-        if self.T_specification is not None: 
-            specs.append(
-                ('T', self.T, 'K')
-            )
-        if self.B_specification is not None: 
-            specs.append(
-                ('Vapor to liquid ratio', self.B, 'by mol')
-            )
-        if self.Q is not None:
-            specs.append(
-                ('Q', self.Q, 'kJ/hr')
-            )
-        if self.P is not None:
-            specs.append(
-                ('P', self.P, 'Pa')
-            )
-        return self.line, specs
     
     @property
     def composition_sensitive(self):
@@ -503,8 +460,6 @@ class StageEquilibrium(Unit):
         if energy_variable == 'B':
             vapor, liquid = self.partition.outs
             if vapor.isempty():
-                if liquid.isempty(): 
-                    raise RuntimeError('empty stage or tray')
                 with liquid.temporary_phase('g'): hV = liquid.h
             else:
                 hV = vapor.h
@@ -523,7 +478,6 @@ class StageEquilibrium(Unit):
         chemicals = self.chemicals
         pIDs = partition.IDs
         IDs = chemicals.IDs
-        self._update_separation_factors()
         if pIDs != IDs and pIDs:
             partition.IDs = IDs
             Sb = np.ones(chemicals.size)
@@ -551,6 +505,7 @@ class StageEquilibrium(Unit):
                     Sb[index] =  inf
         else:
             Sb = self.Sb.copy()
+        self._update_separation_factors()
         top_split = self.top_split
         bottom_split = self.bottom_split
         fresh_inlets, process_inlets, equations = self._begin_equations(composition_sensitive)
@@ -586,21 +541,9 @@ class StageEquilibrium(Unit):
         eq_outs = {}
         infmask = ~np.isfinite(Sb)
         Sb[infmask] = 1
-        if top_split == 1:
-            if bottom_split == 1:
-                eq_outs[top_side_draw] = -Sb
-                eq_outs[bottom_side_draw] = coef = ones
-            else:
-                eq_outs[top_side_draw] = -Sb * (1 - bottom_split)
-                eq_outs[bottom] = coef = ones
-        elif bottom_split == 1:
-            eq_outs[top] = -Sb
-            eq_outs[bottom_side_draw] = coef = ones * (1 - top_split) 
-            coef[infmask] = 0
-        else:
-            eq_outs[top] = -Sb * (1 - bottom_split)
-            eq_outs[bottom] = coef = ones * (1 - top_split) 
-            coef[infmask] = 0
+        eq_outs[top] = -Sb * (1 - bottom_split)
+        eq_outs[bottom] = coef = ones * (1 - top_split) 
+        coef[infmask] = 0
         equations.append(
             (eq_outs, zeros)
         )
@@ -667,8 +610,7 @@ class StageEquilibrium(Unit):
             T = partition.T
             for i in (partition.outs, self.outs): i.T = T
         elif phases == ('L', 'l'):
-            pass
-            # self.partition._run_lle(single_loop=True)
+            self.partition._run_lle(single_loop=True)
         else:
             raise NotImplementedError(f'K for phases {phases} is not yet implemented')
         
@@ -812,6 +754,7 @@ class PhasePartition(Unit):
             else:
                 y = np.ones(y.size) / y.size
             self.gamma_y = gamma_y = f_gamma(y, T)
+        K = self.K
         K = gamma_x / gamma_y 
         y = K * x
         y /= y.sum()
@@ -907,9 +850,9 @@ class PhasePartition(Unit):
         else:
             if update:
                 eq(T=ms.T, P=P or self.P, top_chemical=top_chemical, update=update, single_loop=single_loop)
-                lle_chemicals, K_new, gamma_y, phi = eq._lle_chemicals, eq._K, eq._gamma_y, eq._phi
+                lle_chemicals, K_new, phi = eq._lle_chemicals, eq._K, eq._phi
             else:
-                lle_chemicals, K_new, gamma_y, phi = eq(T=ms.T, P=P or self.P, top_chemical=top_chemical, update=update)
+                lle_chemicals, K_new, phi = eq(T=ms.T, P=P or self.P, top_chemical=top_chemical, update=update)
             if phi == 1 or phi is None:
                 self.B = np.inf
                 self.T = ms.T
@@ -918,7 +861,7 @@ class PhasePartition(Unit):
                 self.B = phi / (1 - phi)
             self.T = ms.T
             IDs = tuple([i.ID for i in lle_chemicals])
-            self._set_arrays(IDs, K=K_new, gamma_y=gamma_y)
+            self._set_arrays(IDs, K=K_new)
     
     def _run_vle(self, P=None, update=True):
         ms = self._get_mixture(update)
@@ -970,30 +913,11 @@ class PhasePartition(Unit):
         self._set_arrays(IDs, K=K_new)
         # TODO: Add option to set S and T using relaxation factor
     
-    def _simulation_error(self):
-        cache = self.T, self.B, copy(self.K), copy(self.dmol), copy(self.Sb), copy(self.gamma_y)
-        um = getattr(self, '_unlinked_multistream', None)
-        m = getattr(self, '_linked_multistream', None)
-        if um is not None: self._unlinked_multistream = copy(um)
-        if m is not None: self._linked_multistream = copy(m)
-        error = super()._simulation_error()
-        self.T, self.B, self.K, self.dmol, self.Sb, self.gamma_y = cache
-        if um is not None: self._unlinked_multistream = um
-        if m is not None: self._linked_multistream = um
-        return error
-    
     def _run(self):
         if self.phases == ('g', 'l'):
             self._run_vle()
         else:
             self._run_lle()
-            
-    def lle_gibbs(self):
-        gamma, IDs, index = self._get_activity_model()
-        f = gamma.f
-        args = gamma.args
-        mol_L, mol = [i.mol for i in self.outs]
-        return tmo.equilibrium.lle.lle_objective_function(mol_L.to_array(), mol.to_array(), self.T, f, args)
 
 
 class MultiStageEquilibrium(Unit):
@@ -1317,7 +1241,6 @@ class MultiStageEquilibrium(Unit):
             feed_stages=None, 
             phases=None, 
             P=101325, 
-            T=None,
             stage_specifications=None, 
             stage_reactions=None,
             partition_data=None, 
@@ -1335,10 +1258,6 @@ class MultiStageEquilibrium(Unit):
         if feed_stages is None: feed_stages = (0, -1)
         if stage_specifications is None: stage_specifications = {}
         elif not isinstance(stage_specifications, dict): stage_specifications = dict(stage_specifications)
-        if T is not None: 
-            for i in range(N_stages):
-                if i in stage_specifications: continue
-                stage_specifications[i] = ('Temperature', T)
         if stage_reactions is None: stage_reactions = {}
         elif not isinstance(stage_reactions, dict): stage_reactions = dict(stage_reactions)
         if top_side_draws is None: top_side_draws = {}
@@ -1349,7 +1268,6 @@ class MultiStageEquilibrium(Unit):
         self.multi_stream = tmo.MultiStream(None, P=P, phases=phases, thermo=self.thermo)
         self.N_stages = N_stages
         self.P = P
-        self.T = T
         self.phases = phases = self.multi_stream.phases # Corrected order
         self._has_vle = 'g' in phases
         self._has_lle = 'L' in phases
@@ -1627,8 +1545,8 @@ class MultiStageEquilibrium(Unit):
         if self._has_vle:
             for i in self.stages: i._update_nonlinearities()
         elif self._has_lle:
-            pass
-            # self.update_lle_variables()
+            # pass
+            self.update_lle_variables()
     
     def _update_aggretated_nonlinearities(self):
         top_flow_rates = self.get_top_flow_rates()
@@ -1795,12 +1713,7 @@ class MultiStageEquilibrium(Unit):
                 for n in range(self.max_attempts-1):
                     self.iter = 0
                     self.attempt = n
-                    try:
-                        top_flow_rates = solver(self._conditional_iter, top_flow_rates)
-                    except:
-                        for i in self.stages: i._run()
-                        for i in reversed(self.stages): i._run()
-                        continue
+                    top_flow_rates = solver(self._conditional_iter, top_flow_rates)
                     if self.iter == self.maxiter:
                         for i in self.stages: i._run()
                         for i in reversed(self.stages): i._run()
@@ -1965,10 +1878,6 @@ class MultiStageEquilibrium(Unit):
             all_stages, feed_stages, stage_specifications,
             top_side_draws, bottom_side_draws,
         ):
-        last = 0
-        for i in sorted(all_stages):
-            if i == last + 1: continue
-            all_stages.add(i)
         N_stages = len(all_stages)
         stage_map = {j: i for i, j in enumerate(sorted(all_stages))}
         feed_stages = [stage_map[i] for i in feed_stages]
@@ -2526,10 +2435,7 @@ class MultiStageEquilibrium(Unit):
                 partition._run_decoupled_KTvle(P=P)
                 T = partition.T
                 for i in (partition.outs + i.outs): i.T = T
-    
-    def lle_gibbs(self):
-        return sum([i.partition.lle_gibbs() for i in self.stages])
-    
+                
     def update_lle_variables(self, top_flow_rates=None):
         stages = self.stages
         P = self.P
@@ -2538,22 +2444,21 @@ class MultiStageEquilibrium(Unit):
         else:
             if top_flow_rates is None: top_flow_rates = self.get_top_flow_rates()
             def psuedo_equilibrium(top_flow_rates):
-                self.set_flow_rates(top_flow_rates)
-                for n, i in enumerate(stages): 
-                    mixer = i.mixer
-                    partition = i.partition
-                    mixer.outs[0].mix_from(
-                        mixer.ins, energy_balance=False,
-                    )
-                    partition._run_decoupled_Kgamma(P=P)
-                    i._update_separation_factors()
-                # self.interpolate_missing_variables()
-                return self.run_mass_balance()
-            top_flow_rates = flx.fixed_point(
-                psuedo_equilibrium, top_flow_rates, **self._psuedo_equilibrium_options,
-            )
+                    self.set_flow_rates(top_flow_rates)
+                    for n, i in enumerate(stages): 
+                        mixer = i.mixer
+                        partition = i.partition
+                        mixer.outs[0].mix_from(
+                            mixer.ins, energy_balance=False,
+                        )
+                        partition._run_decoupled_Kgamma(P=P)
+                        i._update_separation_factors()
+                    # self.interpolate_missing_variables()
+                    return self.run_mass_balance()
             self.set_flow_rates(
-                top_flow_rates
+                flx.fixed_point(
+                    psuedo_equilibrium, top_flow_rates, **self._psuedo_equilibrium_options,
+                )
             )
         for i in stages: 
             mixer = i.mixer

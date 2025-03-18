@@ -17,21 +17,20 @@ from scipy.optimize import shgo, differential_evolution
 import numpy as np
 import pandas as pd
 from chaospy import distributions as shape
-from ._indicator import Indicator
+from ._metric import Metric
 from ._feature import MockFeature
 from ._utils import var_indices, var_columns, indices_to_multiindex
 from ._prediction import ConvergenceModel
-from .._unit import Unit
 from biosteam.exceptions import FailedEvaluation
 from warnings import warn
 from collections.abc import Sized
 from biosteam.utils import TicToc
-from typing import Optional, Callable
+from typing import Callable
 from ._parameter import Parameter
 from .evaluation_tools import load_default_parameters
 import pickle
 
-__all__ = ('Model', 'EasyInputModel')
+__all__ = ('Model',)
 
 def replace_nones(values, replacement):
     for i, j in enumerate(values):
@@ -99,16 +98,16 @@ class Model:
     ----------
     system : System
         Should reflect the model state.
-    indicators : tuple[Indicator]
-        Indicators to be evaluated by model.
+    metrics : tuple[Metric]
+        Metrics to be evaluated by model.
     specification=None : Function, optional
         Loads specifications once all parameters are set. Specification should 
         simulate the system as well.
-    parameters=None : Iterable[Parameter], optional
+    params=None : Iterable[Parameter], optional
         Parameters to sample from.
     exception_hook : callable(exception, sample)
         Function called after a failed evaluation. The exception hook should 
-        return either None or indicator values given the exception and sample.
+        return either None or metric values given the exception and sample.
 
     """
     __slots__ = (
@@ -119,10 +118,10 @@ class Model:
         'table',            # [DataFrame] All arguments and results.
         'retry_evaluation', # [bool] Whether to retry evaluation if it fails
         'convergence_model',# [ConvergenceModel] Prediction model for recycle convergence.
-        '_indicators',         # tuple[Indicator] Indicators to be evaluated by model.
+        '_metrics',         # tuple[Metric] Metrics to be evaluated by model.
         '_index',           # list[int] Order of sample evaluation for performance.
         '_samples',         # [array] Argument sample space.
-        '_exception_hook',  # [callable(exception, sample)] Should return either None or indicator value given an exception and the sample.
+        '_exception_hook',  # [callable(exception, sample)] Should return either None or metric value given an exception and the sample.
     )
     default_optimizer_options = {
         'shgo': dict(f_tol=1e-3, minimizer_kwargs=dict(f_tol=1e-3)),
@@ -156,7 +155,7 @@ class Model:
     def __len__(self):
         return len(self._parameters)
     
-    def get_baseline_scenario(self, parameters=None, array=False):
+    def get_baseline_sample(self, parameters=None, array=False):
         """Return a pandas Series object of parameter baseline values."""
         if parameters is None: parameters = self._parameters
         sample = [] if array else {}
@@ -166,7 +165,6 @@ class Model:
             if array: sample.append(baseline)
             else: sample[p.index] = baseline
         return np.array(sample) if array else pd.Series(sample)
-    get_baseline_sample = get_baseline_scenario
     
     @property
     def optimized_parameters(self):
@@ -203,26 +201,32 @@ class Model:
         
         Parameters
         ----------
-        df_or_filename : pandas.DataFrame or file path to a spreadsheet with the following column titles.
-                         
-            * 'Parameter name' [String] Name of the parameter.
-            
-            * 'Element' [String] 
-                        
-            * 'Units' [String] 
-                        
-            * 'Baseline' [float] The baseline value of the parameter.
-                        
-            * 'Shape' {'Uniform', 'Triangular'} The shape of the parameter distribution.
-                        
-            * 'Lower' [float] The lower value defining the shape of the parameter distribution.
-                        
-            * 'Midpoint' [float] The midpoint value defining the shape of a 'Triangular' parameter distribution.
-                        
-            * 'Upper' [float] The upper value defining the shape of the parameter distribution.
-                        
-            * 'Load statement' [String] A statement executed to load the value of the parameter. 
-            
+        df_or_filename : pandas.DataFrame or file path to a spreadsheet of the following format:
+                         Column titles (these must be included, but others may be added for convenience):
+                            'Parameter name': String
+                                Name of the parameter.
+                            'Element': String, optional
+                            'Kind': String, optional
+                            'Units': String, optional
+                            'Baseline': float or int
+                                The baseline value of the parameter.
+                            'Shape': String, one of ['Uniform', 'Triangular']
+                                The shape of the parameter distribution.
+                            'Lower': float or int
+                                The lower value defining the shape of the parameter distribution.
+                            'Midpoint': float or int
+                                The midpoint value defining the shape of a 'Triangular' parameter distribution.
+                            'Upper': float or int
+                                The upper value defining the shape of the parameter distribution.
+                            'Load statement': String
+                                A statement executed to load the value of the parameter. The value is stored in 
+                                the variable x. A namespace defined in the namespace during EasyInputModel 
+                                initialization may be accessed. 
+                                E.g., to load a value into an example distillation unit D101's light key recovery, 
+                                ensure 'D101' is a key pointing to the D101 unit object in namespace, then 
+                                simply include the load statement: 'D101.Lr = x'. New lines in the statement
+                                may be represented by '\n' or ';'.
+        
         namespace : dict, optional
             Dictionary used to update the namespace accessed when executing
             statements to load values into model parameters. Defaults to the
@@ -245,10 +249,7 @@ class Model:
         for i, row in df.iterrows():
             name = row['Parameter name']
             element = row['Element'] # currently only compatible with String elements
-            try:
-                coupled = row['Coupled']
-            except:
-                coupled = row['Kind'] == 'coupled'
+            kind = row['Kind']
             units = row['Units']
             baseline = row['Baseline']
             shape_data = row['Shape']
@@ -266,7 +267,7 @@ class Model:
             param(name=name, 
                   setter=create_function(load_statements, namespace), 
                   element=element, 
-                  coupled=coupled, 
+                  kind=kind, 
                   units=units,
                   baseline=baseline, 
                   distribution=D)
@@ -317,54 +318,49 @@ class Model:
         return tables_by_shape    
     
     def optimized_parameter(self, *args, **kwargs):
-        return self.parameter(*args, **kwargs, optimized=True, coupled=True)
+        return self.parameter(*args, **kwargs, optimized=True, kind='coupled')
     
-    def parameter(self, 
-            setter: Optional[Callable]=None,
-            element: Optional[Unit]=None, 
-            coupled: Optional[bool]=None,
-            name: Optional[str]=None, 
-            distribution: Optional[str|shape.baseclass.Distribution]=None, 
-            units: Optional[str]=None, 
-            baseline: Optional[float]=None, 
-            bounds: Optional[tuple[float, float]]=None, 
-            hook: Optional[Callable]=None, 
-            description: Optional[str]=None, 
-            optimized=False, 
-            kind=None, # For backwards compatibility
-        ):
+    def parameter(self, setter=None, element=None, kind=None, name=None, 
+                  distribution=None, units=None, baseline=None, bounds=None, 
+                  hook=None, description=None, scale=None, optimized=False):
         """
         Define and register parameter.
         
         Parameters
-        ---------*    
-        setter : 
-            Should set parameter in the element.
-        element : 
-            Element in the system being altered.
-        coupled : 
-            Whether parameter is coupled to the system's mass and energy balances.
-            This allows a ConvergenceModel to predict it's impact on recycle loops.
-            Defaults to False.
-        name : 
-            Name of parameter. If None, default to argument name of setter.
-        distribution : 
-            Parameter distribution.
-        units : 
-            Parameter units of measure
-        baseline : 
+        ----------    
+        setter : function
+                 Should set parameter in the element.
+        element : Unit or :class:`~thermosteam.Stream`
+                  Element in the system being altered.
+        kind : {'coupled', 'isolated', 'design', 'cost'}, optional
+            * 'coupled': parameter is coupled to the system.
+            * 'isolated': parameter does not affect the system but does affect the element (if any).
+            * 'design': parameter only affects design and/or cost of the element.
+        name : str, optional
+               Name of parameter. If None, default to argument name of setter.
+        distribution : chaospy.Dist
+                       Parameter distribution.
+        units : str, optional
+                Parameter units of measure
+        baseline : float, optional
             Baseline value of parameter.
-        bounds : 
+        bounds : tuple[float, float], optional
             Lower and upper bounds of parameter.
-        hook : 
+        hook : Callable, optional
             Should return the new parameter value given the sample.
+        scale : float, optional
+            The sample is multiplied by the scale before setting.
+        
+        Notes
+        -----
+        If kind is 'coupled', account for downstream operations. Otherwise,
+        only account for given element. If kind is 'design' or 'cost', 
+        element must be a Unit object.
         
         """
-        if kind == 'coupled': coupled = True
-        elif coupled is None: coupled = False
         if isinstance(setter, Parameter):
             if element is None: element = setter.element
-            if coupled is None: coupled = setter.coupled
+            if kind is None: kind = setter.kind
             if name is None: name = setter.name
             if distribution is None: distribution = setter.distribution
             if units is None: units = setter.units
@@ -372,18 +368,20 @@ class Model:
             if bounds is None: bounds = setter.bounds
             if hook is None: hook = setter.hook
             if description is None: description = setter.description
+            if scale is None: scale = setter.scale
             setter = setter.setter
         elif isinstance(setter, MockFeature):
             if element is None: element = setter.element
             if name is None: name = setter.name
             if units is None: units = setter.units
         elif not setter:
-            return lambda setter: self.parameter(setter, element, coupled, name,
+            return lambda setter: self.parameter(setter, element, kind, name,
                                                  distribution, units, baseline,
-                                                 bounds, hook, description, optimized)
+                                                 bounds, hook, description, scale, 
+                                                 optimized)
         p = Parameter(name, setter, element,
                       self.system, distribution, units, 
-                      baseline, bounds, coupled, hook, description)
+                      baseline, bounds, kind, hook, description, scale)
         Parameter.check_index_unique(p, self.features)
         if optimized:
             self._optimized_parameters.append(p)
@@ -500,12 +498,8 @@ class Model:
         return loss()
     
     def _update_state(self, sample, convergence_model=None, **kwargs):
-        for i, (f, value) in enumerate(zip(self._parameters, sample)): 
-            if f.active: 
-                f.setter(value)
-                f.last_value = value
-            else:
-                sample[i] = f.last_value
+        for f, s in zip(self._parameters, sample): 
+            f.setter(s if f.scale is None else f.scale * s)
         if convergence_model:
             with convergence_model.practice(sample):
                 return self._specification() if self._specification else self._system.simulate(**kwargs)
@@ -517,26 +511,26 @@ class Model:
         try:
             self._update_state(sample, convergence_model, **kwargs)
             state_updated = True
-            return [i() for i in self.indicators]
+            return [i() for i in self.metrics]
         except Exception as exception:
             if self.retry_evaluation and not state_updated:
                 self._reset_system()
                 try:
                     self._update_state(sample, convergence_model, **kwargs)
-                    return [i() for i in self.indicators]
+                    return [i() for i in self.metrics]
                 except Exception as new_exception: 
                     exception = new_exception
             if self._exception_hook: 
                 values = self._exception_hook(exception, sample)
                 self._reset_system()
-                if isinstance(values, Sized) and len(values) == len(self.indicators):
+                if isinstance(values, Sized) and len(values) == len(self.metrics):
                     return values
                 elif values is not None:
                     raise RuntimeError('exception hook must return either None or '
-                                       'an array of indicator values for the given sample')
+                                       'an array of metric values for the given sample')
             return self._failed_evaluation()
     
-    def __init__(self, system, indicators=None, specification=None, 
+    def __init__(self, system, metrics=None, specification=None, 
                  parameters=None, retry_evaluation=None, exception_hook=None):
         self.specification = specification
         if parameters:
@@ -546,7 +540,7 @@ class Model:
         self._optimized_parameters = []
         self._system = system
         self._specification = specification
-        self.indicators = indicators or ()
+        self.metrics = metrics or ()
         self.exception_hook = 'warn' if exception_hook is None else exception_hook 
         self.retry_evaluation = bool(system) if retry_evaluation is None else retry_evaluation
         self.table = None
@@ -559,7 +553,7 @@ class Model:
         copy._optimized_parameters = self._optimized_parameters.copy()
         copy._system = self._system
         copy._specification = self._specification
-        copy._indicators = self._indicators
+        copy._metrics = self._metrics
         if self.table is None:
             copy._samples = copy.table = None
         else:
@@ -576,7 +570,7 @@ class Model:
     def exception_hook(self):
         """
         [callable(exception, sample)] Function called after a failed 
-        evaluation. The exception hook should return either None or indicator 
+        evaluation. The exception hook should return either None or metric 
         values given the exception and sample.
         
         """
@@ -601,42 +595,35 @@ class Model:
             raise ValueError('exception hook must be either a callable, a string, or None')
     
     @property
-    def indicators(self):
-        """tuple[Indicator] Indicators to be evaluated by model."""
-        return tuple(self._indicators)
-    @indicators.setter
-    def indicators(self, indicators):
-        self._indicators = indicators = list(indicators)
+    def metrics(self):
+        """tuple[Metric] Metrics to be evaluated by model."""
+        return tuple(self._metrics)
+    @metrics.setter
+    def metrics(self, metrics):
+        self._metrics = metrics = list(metrics)
         isa = isinstance
-        for i in indicators:
-            if not isa(i, Indicator):
-                raise ValueError(f"indicators must be '{Indicator.__name__}' "
+        for i in metrics:
+            if not isa(i, Metric):
+                raise ValueError(f"metrics must be '{Metric.__name__}' "
                                  f"objects, not '{type(i).__name__}'")
-        Indicator.check_indices_unique(self.features)
-    
-    # Backwards compatibility
-    metrics = indicators
-    @property
-    def _metrics(self): return self._indicators
-    @_metrics.setter
-    def _metrics(self, metrics): self._indicators = metrics
+        Metric.check_indices_unique(self.features)
     
     @property
     def features(self):
-        return (*self._parameters, *self._optimized_parameters, *self._indicators)
+        return (*self._parameters, *self._optimized_parameters, *self._metrics)
     
-    def indicator(self, getter=None, name=None, units=None, element=None):
+    def metric(self, getter=None, name=None, units=None, element=None):
         """
-        Define and register indicator.
+        Define and register metric.
         
         Parameters
         ----------    
         getter : function, optional
-                 Should return indicator.
+                 Should return metric.
         name : str, optional
-               Name of indicator. If None, defaults to the name of the getter.
+               Name of metric. If None, defaults to the name of the getter.
         units : str, optional
-                Indicator units of measure
+                Metric units of measure
         element : object, optional
                   Element being evaluated. Works mainly for bookkeeping. 
                   Defaults to 'Biorefinery'.
@@ -646,7 +633,7 @@ class Model:
         This method works as a decorator.
         
         """
-        if isinstance(getter, Indicator):
+        if isinstance(getter, Metric):
             if name is None: name = getter.name
             if units is None: units = getter.units
             if element is None: element = getter.element
@@ -656,12 +643,11 @@ class Model:
             if name is None: name = getter.name
             if units is None: units = getter.units
         elif not getter: 
-            return lambda getter: self.indicator(getter, name, units, element)
-        indicator = Indicator(name, getter, units, element)
-        Indicator.check_index_unique(indicator, self.features)
-        self._indicators.append(indicator)
-        return indicator 
-    metric = indicator
+            return lambda getter: self.metric(getter, name, units, element)
+        metric = Metric(name, getter, units, element)
+        Metric.check_index_unique(metric, self.features)
+        self._metrics.append(metric)
+        return metric 
     
     def _sample_hook(self, samples, parameters):
         if any([p.hook for p in parameters]):
@@ -685,7 +671,7 @@ class Model:
             return
         if distance is None: distance = 'cityblock'
         length = samples.shape[0]
-        columns = [i for i, parameter in enumerate(parameters) if parameter.coupled]
+        columns = [i for i, parameter in enumerate(self._parameters) if parameter.kind == 'coupled']
         samples = samples.copy()
         samples = samples[:, columns]
         samples_min = samples.min(axis=0)
@@ -733,7 +719,7 @@ class Model:
             by minimizing perturbations to the system between simulations. The
             optimization problem is equivalent to the travelling salesman problem;
             each scenario of (normalized) parameters represent a point in the path.
-            Defaults to True.
+            Defaults to False.
         file : str, optional
             File to load/save samples and simulation order to/from.
         autosave : bool, optional
@@ -741,7 +727,7 @@ class Model:
         autoload : bool, optional
             Whether to load samples and simulation order from file (if possible).
         distance : str, optional
-            Distance indicator used for sorting. Defaults to 'cityblock'.
+            Distance metric used for sorting. Defaults to 'cityblock'.
             See scipy.spatial.distance.cdist for options.
         algorithm : str, optional
             Algorithm used for sorting. Defaults to 'nearest neighbor'.
@@ -756,10 +742,10 @@ class Model:
             except FileNotFoundError: pass
             else:
                 if (samples is None or (samples.shape == self._samples.shape and (samples == self._samples).all())):
-                    indicators = self._indicators
-                    empty_indicator_data = np.zeros((len(samples), len(indicators)))
-                    self.table = pd.DataFrame(np.hstack((samples, empty_indicator_data)),
-                                              columns=var_columns(parameters + indicators),
+                    metrics = self._metrics
+                    empty_metric_data = np.zeros((len(samples), len(metrics)))
+                    self.table = pd.DataFrame(np.hstack((samples, empty_metric_data)),
+                                              columns=var_columns(parameters + metrics),
                                               dtype=float)
                     return 
         if not isinstance(samples, np.ndarray):
@@ -771,16 +757,15 @@ class Model:
         N_parameters = len(parameters)
         if samples.shape[1] != N_parameters:
             raise ValueError(f'number of parameters in samples ({samples.shape[1]}) must be equal to the number of parameters ({N_parameters})')
-        indicators = self._indicators
+        metrics = self._metrics
         samples = self._sample_hook(samples, parameters)
-        if sort is None: sort = True
-        if sort and any([i.coupled for i in parameters]): 
+        if sort: 
             self._load_sample_order(samples, parameters, distance)
         else:
             self._index = list(range(samples.shape[0]))
-        empty_indicator_data = np.zeros((len(samples), len(indicators)))
-        self.table = pd.DataFrame(np.hstack((samples, empty_indicator_data)),
-                                  columns=var_columns(parameters + indicators),
+        empty_metric_data = np.zeros((len(samples), len(metrics)))
+        self.table = pd.DataFrame(np.hstack((samples, empty_metric_data)),
+                                  columns=var_columns(parameters + metrics),
                                   dtype=float)
         self._samples = samples
         if autosave:
@@ -794,7 +779,7 @@ class Model:
                 with open(file, 'wb') as f: pickle.dump(obj, f)
             
     def single_point_sensitivity(self, 
-            etol=0.01, array=False, parameters=None, indicators=None, evaluate=None, 
+            etol=0.01, array=False, parameters=None, metrics=None, evaluate=None, 
             **kwargs
         ):
         if parameters is None: parameters = self.parameters
@@ -802,9 +787,9 @@ class Model:
         sample = [i.baseline for i in parameters]
         N_parameters = len(parameters)
         index = range(N_parameters)
-        if indicators is None: indicators = self.indicators
-        N_indicators = len(indicators)
-        values_lb = np.zeros([N_parameters, N_indicators])
+        if metrics is None: metrics = self.metrics
+        N_metrics = len(metrics)
+        values_lb = np.zeros([N_parameters, N_metrics])
         values_ub = values_lb.copy()
         if evaluate is None: evaluate = self._evaluate_sample
         baseline_1 = np.array(evaluate(sample, **kwargs))
@@ -831,7 +816,7 @@ class Model:
         for i, idx in enumerate(index):
             if relative_error[i] > etol:
                 print(RuntimeError(
-                    f"inconsistent model; {indicators[idx]} has a value of "
+                    f"inconsistent model; {metrics[idx]} has a value of "
                     f"{baseline_1[idx]} before evaluating sensitivity and "
                     f"{baseline_2[idx]} after"
                 ))
@@ -839,11 +824,11 @@ class Model:
         if array:
             return baseline, values_lb, values_ub
         else:
-            indicator_index = var_columns(indicators)
-            baseline = pd.Series(baseline, index=indicator_index)
+            metric_index = var_columns(metrics)
+            baseline = pd.Series(baseline, index=metric_index)
             df_lb = pd.DataFrame(values_lb, 
                                 index=var_columns(parameters),
-                                columns=indicator_index)
+                                columns=metric_index)
             df_ub = df_lb.copy()
             df_ub[:] = values_ub
             return baseline, df_lb, df_ub
@@ -855,8 +840,8 @@ class Model:
         if (table_index != table.index).any() or (table_columns != table.columns).any():
             if safe: raise ValueError('table layout does not match autoload file')
         del table_index, table_columns
-        indicators = self._indicators
-        table[var_indices(indicators)] = replace_nones(values, [np.nan] * len(indicators))
+        metrics = self._metrics
+        table[var_indices(metrics)] = replace_nones(values, [np.nan] * len(metrics))
     
     def optimize(self, 
             loss, 
@@ -898,12 +883,12 @@ class Model:
             )
         else:
             raise ValueError(f'invalid optimization method {method!r}')
-        return result, convergence_model
+        return result
     
     def evaluate(self, notify=0, file=None, autosave=0, autoload=False,
                  convergence_model=None, **kwargs):
         """
-        Evaluate indicators over the loaded samples and save values to `table`.
+        Evaluate metrics over the loaded samples and save values to `table`.
         
         Parameters
         ----------
@@ -986,7 +971,7 @@ class Model:
                         os.mkdir(head)
                         with open(file, 'wb') as f: pickle.dump(obj, f)
         finally:
-            table[var_indices(self._indicators)] = replace_nones(values, [np.nan] * len(self.indicators))
+            table[var_indices(self._metrics)] = replace_nones(values, [np.nan] * len(self.metrics))
     
     def _reset_system(self):
         if self._system is None: return 
@@ -995,23 +980,19 @@ class Model:
     
     def _failed_evaluation(self):
         self._reset_system()
-        return [np.nan] * len(self.indicators)
+        return [np.nan] * len(self.metrics)
     
-    def indicators_at_baseline(self):
-        """Return indicator values at baseline sample."""
-        baseline = self.get_baseline_scenario()
+    def metrics_at_baseline(self):
+        """Return metric values at baseline sample."""
+        baseline = self.get_baseline_sample()
         return self(baseline)
-    metrics_at_baseline = indicators_at_baseline
     
-    def evaluate_across_coordinate(self,
-            name, f_coordinate, coordinate, *, 
-            xlfile=None, notify=0, notify_coordinate=True,
-            multi_coordinate=False, 
-            simulation_independent_coordinate=False,
-            f_evaluate=None
-        ):
+    def evaluate_across_coordinate(self, name, f_coordinate, coordinate,
+                                   *, xlfile=None, notify=0, notify_coordinate=True,
+                                   multi_coordinate=False, convergence_model=None,
+                                   f_evaluate=None):
         """
-        Evaluate across coordinate and save sample indicators.
+        Evaluate across coordinate and save sample metrics.
         
         Parameters
         ----------
@@ -1025,96 +1006,38 @@ class Model:
             Name of file to save. File must end with ".xlsx"
         rule : str, optional
             Sampling rule. Defaults to 'L'.
-        notify_coordinate : bool, optional
+        notify : bool, optional
             If True, notify elapsed time after each coordinate evaluation. Defaults to True.
-        notify : int, optional
-            Notify elapsed time after given number of scenario evaluations.
         f_evaluate : callable, optional
             Function to evaluate model. Defaults to evaluate method.
         
         """
-        if (isinstance(f_coordinate, Parameter)
-            and f_coordinate in self.parameters
-            and f_coordinate.active):
-            active = f_coordinate.active
-            f_coordinate.active = False
-            try:
-                return self.evaluate_across_coordinate(
-                    name, f_coordinate, coordinate,
-                    xlfile=xlfile, notify=notify, notify_coordinate=notify_coordinate,
-                    multi_coordinate=multi_coordinate,
-                    simulation_independent_coordinate=simulation_independent_coordinate,
-                    f_evaluate=f_evaluate
-                )
-            finally:
-                f_coordinate.active = active
         N_points = len(coordinate)
-        if simulation_independent_coordinate:
-            if f_evaluate is not None: 
-                raise ValueError(
-                    'cannot pass `f_evaluate` if coordinate is '
-                    'independent from simulation'
-                )
-            f_evaluate = self.evaluate
-            samples = self._samples
-            if samples is None: raise RuntimeError('must load samples before evaluating')
-            evaluate_sample = self._evaluate_sample
-            table = self.table
-            if notify:
-                from biosteam.utils import TicToc
-                timer = TicToc()
-                timer.tic()
-                count = [0]
-                def evaluate(sample, count=count):
-                    count[0] += 1
-                    values = evaluate_sample(sample)
-                    if not count[0] % notify:
-                        print(f"{count} Elapsed time: {timer.elapsed_time:.0f} sec")
-                    return values
-            else:
-                evaluate = evaluate_sample
-            N_samples, _ = samples.shape
-            number = 0
-            index = self._index
-            N_samples, _ = self.table.shape
-            indicator_indices = var_indices(self.indicators)
-            shape = (N_samples, N_points)
-            indicator_data = {i: np.zeros(shape) for i in indicator_indices}
-            for number, i in enumerate(index, number + 1): 
-                evaluate(samples[i])
-                for j, x in enumerate(coordinate):
-                    f_coordinate(x)
-                    for key, indicator in zip(indicator_data, self.indicators):
-                        data = indicator_data[key]
-                        try:
-                            data[i, j] = indicator()
-                        except:
-                            data[i, j] = None
+        if f_evaluate is None: f_evaluate = self.evaluate
+        
+        # Initialize timer
+        if notify_coordinate:
+            from biosteam.utils import TicToc
+            timer = TicToc()
+            timer.tic()
+            def evaluate(**kwargs):
+                f_evaluate(**kwargs)
+                print(f"[Coordinate {n}] Elapsed time: {timer.elapsed_time:.0f} sec")
         else:
-            if f_evaluate is None: f_evaluate = self.evaluate
-            
-            # Initialize timer
-            if notify_coordinate:
-                from biosteam.utils import TicToc
-                timer = TicToc()
-                timer.tic()
-                def evaluate(**kwargs):
-                    f_evaluate(**kwargs)
-                    print(f"[Coordinate {n}] Elapsed time: {timer.elapsed_time:.0f} sec")
-            else:
-                evaluate = f_evaluate
-            indicator_data = None
-            for n, x in enumerate(coordinate):
-                f_coordinate(*x) if multi_coordinate else f_coordinate(x)
-                evaluate(notify=notify)
-                if indicator_data is None:
-                    # Initialize data containers dynamically in case samples are loaded during evaluation
-                    N_samples, _ = self.table.shape
-                    indicator_indices = var_indices(self.indicators)
-                    shape = (N_samples, N_points)
-                    indicator_data = {i: np.zeros(shape) for i in indicator_indices}
-                for indicator in indicator_data:
-                    indicator_data[indicator][:, n] = self.table[indicator]
+            evaluate = f_evaluate
+        
+        metric_data = None
+        for n, x in enumerate(coordinate):
+            f_coordinate(*x) if multi_coordinate else f_coordinate(x)
+            evaluate(notify=notify, convergence_model=convergence_model)
+            # Initialize data containers dynamically in case samples are loaded during evaluation
+            if metric_data is None:
+                N_samples, _ = self.table.shape
+                metric_indices = var_indices(self.metrics)
+                shape = (N_samples, N_points)
+                metric_data = {i: np.zeros(shape) for i in metric_indices}
+            for metric in metric_data:
+                metric_data[metric][:, n] = self.table[metric]
         
         if xlfile:
             if multi_coordinate:
@@ -1128,27 +1051,27 @@ class Model:
                                 columns=columns)
             
             with pd.ExcelWriter(xlfile) as writer:
-                for indicator in self.indicators:
-                    data[:] = indicator_data[indicator.index]
-                    data.to_excel(writer, sheet_name=indicator.short_description)
-        return indicator_data
+                for metric in self.metrics:
+                    data[:] = metric_data[metric.index]
+                    data.to_excel(writer, sheet_name=metric.short_description)
+        return metric_data
     
-    def spearman(self, parameters=None, indicators=None):
+    def spearman(self, parameters=None, metrics=None):
         warn(DeprecationWarning('this method will be deprecated in biosteam 2.25; '
                                 'use spearman_r instead'), stacklevel=2)
-        return self.spearman_r(parameters, indicators)[0]
+        return self.spearman_r(parameters, metrics)[0]
     
-    def spearman_r(self, parameters=None, indicators=None, filter=None, **kwargs): # pragma: no cover
+    def spearman_r(self, parameters=None, metrics=None, filter=None, **kwargs): # pragma: no cover
         """
-        Return two DataFrame objects of Spearman's rho and p-values between indicators 
+        Return two DataFrame objects of Spearman's rho and p-values between metrics 
         and parameters.
         
         Parameters
         ----------
         parameters : Iterable[Parameter], optional
-            Parameters to be correlated with indicators. Defaults to all parameters.
-        indicators : Iterable[Indicator], optional 
-            Indicators to be correlated with parameters. Defaults to all indicators.
+            Parameters to be correlated with metrics. Defaults to all parameters.
+        metrics : Iterable[Metric], optional 
+            Metrics to be correlated with parameters. Defaults to all metrics.
         
         Other Parameters
         ----------------
@@ -1174,19 +1097,19 @@ class Model:
         
         """
         from scipy.stats import spearmanr
-        return self._correlation(spearmanr, parameters, indicators, filter, kwargs)
+        return self._correlation(spearmanr, parameters, metrics, filter, kwargs)
     
-    def pearson_r(self, parameters=None, indicators=None, filter=None, **kwargs):
+    def pearson_r(self, parameters=None, metrics=None, filter=None, **kwargs):
         """
-        Return two DataFrame objects of Pearson's rho and p-values between indicators 
+        Return two DataFrame objects of Pearson's rho and p-values between metrics 
         and parameters.
         
         Parameters
         ----------
         parameters : Iterable[Parameter], optional
-            Parameters to be correlated with indicators. Defaults to all parameters.
-        indicators : Iterable[Indicator], optional 
-            Indicators to be correlated with parameters. Defaults to all indicators.
+            Parameters to be correlated with metrics. Defaults to all parameters.
+        metrics : Iterable[Metric], optional 
+            Metrics to be correlated with parameters. Defaults to all metrics.
             
         Other Parameters
         ----------------
@@ -1212,19 +1135,19 @@ class Model:
         
         """
         from scipy.stats import pearsonr
-        return self._correlation(pearsonr, parameters, indicators, filter, kwargs)
+        return self._correlation(pearsonr, parameters, metrics, filter, kwargs)
     
-    def kendall_tau(self, parameters=None, indicators=None, filter=None, **kwargs):
+    def kendall_tau(self, parameters=None, metrics=None, filter=None, **kwargs):
         """
-        Return two DataFrame objects of Kendall's tau and p-values between indicators 
+        Return two DataFrame objects of Kendall's tau and p-values between metrics 
         and parameters.
         
         Parameters
         ----------
         parameters : Iterable[Parameter], optional
-            Parameters to be correlated with indicators. Defaults to all parameters.
-        indicators : Iterable[Indicator], optional 
-            Indicators to be correlated with parameters. Defaults to all indicators.
+            Parameters to be correlated with metrics. Defaults to all parameters.
+        metrics : Iterable[Metric], optional 
+            Metrics to be correlated with parameters. Defaults to all metrics.
             
         Other Parameters
         ----------------
@@ -1250,16 +1173,16 @@ class Model:
         
         """
         from scipy.stats import kendalltau
-        return self._correlation(kendalltau, parameters, indicators, filter, kwargs)
+        return self._correlation(kendalltau, parameters, metrics, filter, kwargs)
     
-    def kolmogorov_smirnov_d(self, parameters=None, indicators=None, thresholds=[],
+    def kolmogorov_smirnov_d(self, parameters=None, metrics=None, thresholds=[],
                              filter=None, **kwargs):
         """
         Return two DataFrame objects of Kolmogorov–Smirnov's D and p-values
-        with the given thresholds for the indicators.
+        with the given thresholds for the metrics.
         
         For one particular parameter, all of the sampled values will be divided into two sets,
-        one where the resulting indicator value is smaller than or equal to the threshold,
+        one where the resulting metric value is smaller than or equal to the threshold,
         and the other where the resulting value is larger than the threshold.
         
         Kolmogorov–Smirnov test will then be performed for these two sets of values
@@ -1268,9 +1191,9 @@ class Model:
         Parameters
         ----------
         parameters : Iterable[Parameter], optional
-            Parameters to be correlated with indicators. Defaults to all parameters.
-        indicators : Iterable[Indicator], optional 
-            Indicators to be correlated with parameters. Defaults to all indicators.
+            Parameters to be correlated with metrics. Defaults to all parameters.
+        metrics : Iterable[Metric], optional 
+            Metrics to be correlated with parameters. Defaults to all metrics.
         thresholds : Iterable[float]
             The thresholds for separating parameters into sets.
             
@@ -1298,16 +1221,16 @@ class Model:
         
         """
         from scipy.stats import kstest
-        indicators = indicators or self.indicators
-        if len(thresholds) != len(indicators):
-            raise ValueError(f'The number of indicators {len(indicators)} must match '
+        metrics = metrics or self.metrics
+        if len(thresholds) != len(metrics):
+            raise ValueError(f'The number of metrics {len(metrics)} must match '
                              f'the number of thresholds ({len(thresholds)}).')
         kwargs['thresholds'] = thresholds
-        return self._correlation(kstest, parameters, indicators, filter, kwargs)
+        return self._correlation(kstest, parameters, metrics, filter, kwargs)
     
-    def _correlation(self, f, parameters, indicators, filter, kwargs):
+    def _correlation(self, f, parameters, metrics, filter, kwargs):
         """
-        Return two DataFrame objects of statistics and p-values between indicators 
+        Return two DataFrame objects of statistics and p-values between metrics 
         and parameters.
         
         Parameters
@@ -1315,9 +1238,9 @@ class Model:
         f : Callable
             Function with signature f(x, y) -> stat, p
         parameters : Iterable[Parameter], optional
-            Parameters to be correlated with indicators. Defaults to all parameters.
-        indicators : Iterable[Indicator], optional 
-            Indicators to be correlated with parameters. Defaults to all indicators.
+            Parameters to be correlated with metrics. Defaults to all parameters.
+        metrics : Iterable[Metric], optional 
+            Metrics to be correlated with parameters. Defaults to all metrics.
         filter : Callable or string, optional
             Function that accepts 1d arrays of x and y values and returns 
             filtered x and y values to correlate. May also
@@ -1341,8 +1264,8 @@ class Model:
         index = table.columns.get_loc
         parameter_indices = var_indices(parameters)
         parameter_data = [values[index(i)] for i in parameter_indices]
-        indicator_indices = var_indices(indicators or self.indicators)
-        indicator_data = [values[index(i)] for i in indicator_indices]
+        metric_indices = var_indices(metrics or self.metrics)
+        metric_data = [values[index(i)] for i in metric_indices]
                 
         if not filter: filter = 'propagate nan'
         if isinstance(filter, str):
@@ -1377,39 +1300,39 @@ class Model:
                             "not a '{type(filter).__name__}' object")
 
         if 'thresholds' not in kwargs:
-            data = np.array([[corr(p.astype(float), m.astype(float)) for m in indicator_data] for p in parameter_data])
+            data = np.array([[corr(p.astype(float), m.astype(float)) for m in metric_data] for p in parameter_data])
         else: # KS test
             thresholds = kwargs.pop('thresholds')
             data = np.array(
                 [
-                    [corr(parameter_data[n_p][indicator_data[n_m]<=thresholds[n_m]],
-                          parameter_data[n_p][indicator_data[n_m]>thresholds[n_m]]) \
-                     for n_m in range(len(indicator_data))] \
+                    [corr(parameter_data[n_p][metric_data[n_m]<=thresholds[n_m]],
+                          parameter_data[n_p][metric_data[n_m]>thresholds[n_m]]) \
+                     for n_m in range(len(metric_data))] \
                 for n_p in range(len(parameter_data))])
         
         index = indices_to_multiindex(parameter_indices, ('Element', 'Parameter'))
-        columns = indices_to_multiindex(indicator_indices, ('Element', 'Indicator'))        
+        columns = indices_to_multiindex(metric_indices, ('Element', 'Metric'))        
         return [pd.DataFrame(i, index=index, columns=columns) for i in (data[..., 0], data[..., 1])]
         
-    def create_fitted_model(self, parameters, indicators): # pragma: no cover
+    def create_fitted_model(self, parameters, metrics): # pragma: no cover
         from pipeml import FittedModel
         Xdf = self.table[[i.index for i in parameters]]
-        ydf_index = indicators.index if isinstance(indicators, Indicator) else [i.index for i in indicators]
+        ydf_index = metrics.index if isinstance(metrics, Metric) else [i.index for i in metrics]
         ydf = self.table[ydf_index]
         return FittedModel.from_dfs(Xdf, ydf)
     
     def __call__(self, sample, **kwargs):
-        """Return pandas Series of indicator values at given sample."""
+        """Return pandas Series of metric values at given sample."""
         self._update_state(np.asarray(sample, dtype=float), **kwargs)
-        return pd.Series({i.index: i() for i in self._indicators})
+        return pd.Series({i.index: i() for i in self._metrics})
     
     def _repr(self, m):
         clsname = type(self).__name__
         newline = "\n" + " "*(len(clsname)+2)
-        return f'{clsname}: {newline.join([i.describe() for i in self.indicators])}'
+        return f'{clsname}: {newline.join([i.describe() for i in self.metrics])}'
     
     def __repr__(self):
-        return f'<{type(self).__name__}: {len(self.parameters)}-parameters, {len(self.indicators)}-indicators>'
+        return f'<{type(self).__name__}: {len(self.parameters)}-parameters, {len(self.metrics)}-metrics>'
     
     def _info(self, p, m):
         info = f'{type(self).__name__}:'
@@ -1427,26 +1350,24 @@ class Model:
             ])
             if p < p_max: info += newline + "..." 
         else:
-            info += '\nparameters: None'
-        indicators = self._indicators
-        if indicators: 
-            m_max = len(indicators)
+            info += '\n(No parameters)'
+        metrics = self._metrics
+        if metrics: 
+            m_max = len(metrics)
             if m is None: m = m_max
-            mtitle = 'indicators: '
+            mtitle = 'metrics: '
             info += '\n' + mtitle
             newline = "\n" + " "*(len(mtitle))
             info += newline.join([
-                indicators[i].describe() for i in range(m)
+                metrics[i].describe() for i in range(m)
             ])
             if m < m_max: info += newline + "..." 
         else:
-            info += '\nindicators: None'
+            info += '\n(No metrics)'
+            if m < m_max: info += newline + "..." 
         return info
     
     def show(self, p=None, m=None):
-        """Return information on p-parameters and m-indicators."""
+        """Return information on p-parameters and m-metrics."""
         print(self._info(p, m))
     _ipython_display_ = show
-    
-EasyInputModel = Model
-Model.load_parameter_distributions = Model.parameters_from_df

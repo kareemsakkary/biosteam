@@ -1,0 +1,29 @@
+from biosteam import Stream, settings
+import biosteam as bst
+bst.nbtutorial()
+
+# First set the property package
+settings.set_thermo(['Water', 'Ethanol'])
+
+# Create the feed at the bubble point
+feed = Stream('feed', Water=1.08e+03, Ethanol=586)
+bp = feed.bubble_point_at_P()
+feed.T = bp.T # Feed at bubble point temperature
+
+# Create a distillation column and simulate
+# Use BinaryDistillation for 2-components
+# For 3+ components, use ShortcutColumn
+# For rigorous distillation with side draws and feeds at multiple stages, use MESHDistillation
+D1 = bst.BinaryDistillation( 
+    'D1', ins=feed,
+    outs=('distillate', 'bottoms_product'),
+    LHK=('Ethanol', 'Water'), # Light and heavy keys
+    y_top=0.79, # Light key composition at the distillate
+    x_bot=0.001, # Light key composition at the bottoms product
+    k=1.25, # Ratio of actual reflux over minimum reflux
+    is_divided=True, # Whether the rectifying and stripping sections are divided
+)
+D1.simulate()
+
+D1.diagram(format='png')
+D1.show()

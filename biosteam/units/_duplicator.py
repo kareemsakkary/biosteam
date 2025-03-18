@@ -64,5 +64,3 @@ class Duplicator(Unit, isabstract=True):
         duplicated_outs = self.outs
         for stream in duplicated_outs:
             stream.link_with(feed)
-
-    def _run(self): pass

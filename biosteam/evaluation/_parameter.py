@@ -38,33 +38,28 @@ class Parameter(Feature):
         Baseline value of parameter.
     bounds : tuple[float, float]
         Lower and upper bounds of parameter.
-    coupled : str
-        Whether parameter is coupled to the system's mass and energy balances.
-        This allows a ConvergenceModel to predict it's impact on recycle loops.
-        Defaults to False.
+    kind : str
+        * 'design': Parameter only affects unit operation design.
+        * 'coupled': Parameter affects mass and energy balances.
+        * 'isolated': Parameter does not affect the system in any way.
     hook : Callable
         Should return the new parameter value given the sample.
+    scale : float, optional
+        The sample is multiplied by the scale before setting.
         
     """
     __slots__ = ('setter', 'system', 'distribution', 
-                 'baseline', 'bounds', 'coupled', 'hook',
-                 'description', 'active', 'last_value')
+                 'baseline', 'bounds', 'kind', 'hook',
+                 'description', 'scale')
     
     def __init__(self, name, setter, element, system, distribution,
-                 units, baseline, bounds, coupled, hook, description):
+                 units, baseline, bounds, kind, hook, description, scale):
         if not name: name, *_ = signature(setter).parameters.keys()
         super().__init__(format_title(name), units, element)
+        if kind is None: kind = 'isolated'
         self.setter = setter.setter if isinstance(setter, Parameter) else setter
         self.system = system
-        if isinstance(distribution, str):
-            match distribution.lower():
-                case 'triangle' | 'triangular':
-                    distribution = shape.Triangle(bounds[0], baseline, bounds[1])
-                case 'uniform':
-                    distribution = shape.Uniform(*bounds)
-                case _:
-                    raise ValueError(f"invalid distribution {distribution!r}; distribution must be either 'triangular' or 'uniform'")
-        elif not bounds:
+        if not bounds:
             if distribution: bounds = (distribution.lower[0], distribution.upper[0])
         elif not distribution:
             distribution = shape.Uniform(*bounds)
@@ -73,11 +68,10 @@ class Parameter(Feature):
         self.distribution = distribution
         self.baseline = baseline
         self.bounds = bounds
-        self.coupled = coupled
+        self.kind = kind
         self.hook = hook
         self.description = description
-        self.active = True
-        self.last_value = None
+        self.scale = scale
     
     @classmethod
     def sort_parameters(cls, parameters):
@@ -90,7 +84,7 @@ class Parameter(Feature):
         unit_path = system.units
         length = len(unit_path)
         def key(parameter):
-            if parameter.coupled:
+            if parameter.kind == 'coupled':
                 unit = parameter.unit
                 if unit: return unit_path.index(unit) 
             return length
@@ -115,18 +109,23 @@ class Parameter(Feature):
     
     def simulate(self, **dyn_sim_kwargs):
         """Simulate parameter."""
-        if self.coupled:
-            subsystem = self.subsystem
-            if not subsystem: raise RuntimeError('no system to simulate')
-            self.subsystem.simulate(**dyn_sim_kwargs)
-        else:
+        kind = self.kind
+        if kind in ('design', 'cost'):
             unit = self.unit
-            if hasattr(unit, '_reevaluate'): unit._reevaluate()
+            if not unit: raise RuntimeError(f'no unit to run {kind} algorithm')
+            unit._reevaluate()
+        elif kind == 'coupled':
+            subsystem = self.subsystem
+            if not subsystem: raise RuntimeError(f'no system to run {kind} algorithm')
+            self.subsystem.simulate(**dyn_sim_kwargs)
+        elif kind == 'isolated':
+            pass
+        else:
+            raise RuntimeError(f"invalid parameter kind '{kind}'")
     
     def __call__(self, value):
         if self.hook: value = self.hook(value)
-        self.setter(value)
-        self.last_value = value
+        self.setter(value if self.scale is None else value * self.scale)
         self.simulate()
     
     def _info(self):

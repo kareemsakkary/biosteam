@@ -9,10 +9,10 @@
 """
 from __future__ import annotations
 from thermosteam.units_of_measure import (
-    convert, DisplayUnits, UnitsOfMeasure, get_dimensionality,
+    convert, DisplayUnits, AbsoluteUnitsOfMeasure, get_dimensionality,
     heat_utility_units_of_measure
 )
-from thermosteam.utils import unregistered, define_units_of_measure
+from thermosteam.utils import unregistered, units_of_measure
 from thermosteam import Thermo, Stream, ThermalCondition, settings
 from .exceptions import DimensionError
 from math import copysign
@@ -26,9 +26,9 @@ __all__ = ('HeatUtility', 'UtilityAgent')
 # ^This table was made using data from Busche, 1995
 # Entry temperature conditions of coolants taken from Table 12.1 in Warren, 2016
 
-mol_basis_units = UnitsOfMeasure('kmol')
-mass_basis_units = UnitsOfMeasure('kg')
-energy_basis_units = UnitsOfMeasure('kJ')
+mol_basis_units = AbsoluteUnitsOfMeasure('kmol')
+mass_basis_units = AbsoluteUnitsOfMeasure('kg')
+energy_basis_units = AbsoluteUnitsOfMeasure('kJ')
 
 # %% Utility agents
 
@@ -69,16 +69,12 @@ class UtilityAgent(Stream):
         Fraction of heat transferred accounting for losses to the environment (must be between 0 to 1). Defaults to 1.
     isfuel :
         Whether to burn the agent as a isfuel for heat.
-    dT :
-        Minimum temperature change between inlet and outlet utility. A positive value
-        prevents near infinite flows when utility agents use sensible heats.
     **chemical_flows : float
         ID - flow pairs.
         
     """
     __slots__ = ('T_limit', '_heat_transfer_price', 'utility_stream_dump',
-                 '_regeneration_price', 'heat_transfer_efficiency', 'isfuel',
-                 'dT')
+                 '_regeneration_price', 'heat_transfer_efficiency', 'isfuel')
     def __init__(self, 
                  ID: Optional[str]='',
                  phase: Optional[str]='l',
@@ -91,7 +87,6 @@ class UtilityAgent(Stream):
                  regeneration_price: float=0.,
                  heat_transfer_efficiency: float=1.,
                  isfuel: bool=False,
-                 dT: Optional[float]=0,
                  **chemical_flows: float):
         self._thermal_condition = ThermalCondition(T, P)
         thermo = self._load_thermo(thermo)
@@ -110,7 +105,6 @@ class UtilityAgent(Stream):
         self.regeneration_price = regeneration_price
         self.heat_transfer_efficiency = heat_transfer_efficiency
         self.isfuel = isfuel
-        self.dT = dT
         self.utility_stream_dump = []
     
     def _get_property(self, name, flow=False, nophase=False, T=None, P=None):
@@ -125,7 +119,7 @@ class UtilityAgent(Stream):
         if nophase:
             literal = (T, P)
         else:
-            phase = imol._phase
+            phase = imol._phase._phase
             literal = (phase, T, P)
         key = (name, literal)
         if key in property_cache: return property_cache[key]
@@ -242,7 +236,7 @@ class UtilityAgent(Stream):
 
 # %%
 
-@define_units_of_measure(heat_utility_units_of_measure)
+@units_of_measure(heat_utility_units_of_measure)
 class HeatUtility:
     """
     Create an HeatUtility object that can choose a utility stream and 
@@ -321,7 +315,7 @@ class HeatUtility:
     thermo_natural_gas: Thermo = Thermo(['Methane', 'N2', 'CO2', 'O2', 'H2O'])
 
     #: Characterization factor data (value and units) by agent ID and impact key.
-    characterization_factors: dict[tuple[str, str], tuple[float, UnitsOfMeasure]] = {}
+    characterization_factors: dict[tuple[str, str], tuple[float, AbsoluteUnitsOfMeasure]] = {}
     
     #: All cooling utilities available.
     cooling_agents: list[UtilityAgent]
@@ -581,15 +575,13 @@ class HeatUtility:
             thermo=thermo_water,
             T_limit = 324.817,
             regeneration_price = 4.8785e-4,
-            dT=2.,
         )
         chilled_water = UtilityAgent(
             'chilled_water',
             Water=1, T=280.372, P=101325,
             thermo=thermo_water,
             T_limit = 300.372,
-            heat_transfer_price = 5e-6,
-            dT=2.,
+            heat_transfer_price = 5e-6
         )
         chilled_brine = UtilityAgent(
             'chilled_brine',
@@ -597,7 +589,6 @@ class HeatUtility:
             thermo=thermo_water,
             T_limit = 275.372,
             heat_transfer_price = 8.145e-6,
-            dT=2.,
         )
         propane = UtilityAgent(
             'propane',
@@ -607,7 +598,6 @@ class HeatUtility:
             P=cls.thermo_propane.chemicals.Propane.Psat(238.70),
             heat_transfer_price = 13.17e-6,
             phase='l',
-            dT=1.,
         )
         propylene = UtilityAgent(
             'propylene',
@@ -617,7 +607,6 @@ class HeatUtility:
             P=cls.thermo_propylene.chemicals.Propylene.Psat(227.59),
             heat_transfer_price = 16.54e-6, # Lever rule with -30 and -90 F prices
             phase='l',
-            dT=1.,
         )
         ethylene = UtilityAgent(
             'ethylene',
@@ -627,7 +616,6 @@ class HeatUtility:
             P=cls.thermo_ethylene.chemicals.Ethylene.Psat(172.04),
             heat_transfer_price = 33.2e-06,
             phase='l',
-            dT=1.,
         )
         cls.cooling_agents = [cooling_water, 
                               chilled_water, 
@@ -877,7 +865,7 @@ class HeatUtility:
         
         """
         for agent in cls.heating_agents:
-            if T_pinch < agent.T - agent.dT or agent.isfuel: return agent
+            if T_pinch < agent.T or agent.isfuel: return agent
         raise RuntimeError(f'no heating agent that can heat over {T_pinch} K')    
 
     @classmethod
@@ -891,7 +879,7 @@ class HeatUtility:
         
         """
         for agent in cls.cooling_agents:
-            if T_pinch > agent.T + agent.dT: return agent
+            if T_pinch > agent.T: return agent
         raise RuntimeError(f'no cooling agent that can cool under {T_pinch} K')    
 
     def load_agent(self, agent: UtilityAgent):

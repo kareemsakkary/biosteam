@@ -181,23 +181,18 @@ def create_facilities(
 )
 def create_coheat_and_power_system(
         ins, outs, combustible_slurries=None, combustible_gases=None, 
-        autopopulate=None, slurry_feed=True, gas_feed=True, **kwargs
+        autopopulate=None, **kwargs
     ):
     makeup_water, natural_gas, lime, boiler_chemicals, air = ins
     if 'fuel_source' in kwargs: natural_gas.ID = kwargs['fuel_source'].lower()
-    if slurry_feed and autopopulate or combustible_slurries:
-        slurry = bst.Stream('to_boiler')
-        slurry_mixer = bst.Mixer(ins=combustible_slurries or [], outs=slurry)
-        slurry_mixer.register_alias('slurry_mixer')
+    if autopopulate or combustible_slurries:
+        slurry_mixer = bst.Mixer('slurry_mixer', ins=combustible_slurries or [])
         slurry = slurry_mixer-0
     else:
         slurry = None
-    if gas_feed and autopopulate or combustible_gases:
-        gas_to_boiler = bst.Stream('gas_to_boiler')
-        gas_mixer = bst.Mixer(ins=combustible_gases or [], outs=gas_to_boiler)
-        gas_mixer.register_alias('gas_mixer')
+    if autopopulate or combustible_gases:
+        gas_mixer = bst.Mixer('gas_mixer', ins=combustible_gases or [])
         gas = gas_mixer-0
-        gas.phase = 'g'
     else:
         gas = None
     BT = bst.BoilerTurbogenerator(
@@ -211,13 +206,11 @@ def create_coheat_and_power_system(
     
     @BT.add_specification(run=True)
     def autopopulate_combustibles():
-        if BT.autopopulate and not (slurry_feed and slurry_mixer.ins) and not (gas_feed and gas_mixer.ins):
+        if BT.autopopulate and not slurry_mixer.ins and not gas_mixer.ins:
             streams = bst.FreeProductStreams(BT.system.streams)
-            if slurry_feed: 
-                slurry_mixer.ins.extend([i for i in streams.combustible_slurries if i is not slurry])
-                slurry_mixer.run_until(BT)
-            if gas_feed: 
-                gas_mixer.ins.extend([i for i in streams.combustible_gases if i is not gas])
-                gas_mixer.run_until(BT)
+            slurry_mixer.ins.extend(streams.combustible_slurries)
+            gas_mixer.ins.extend(streams.combustible_gases)
+            slurry_mixer.run_until(BT)
+            gas_mixer.run_until(BT)
         else:
             BT.autopopulate = False

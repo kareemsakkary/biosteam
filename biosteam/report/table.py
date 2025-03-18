@@ -16,8 +16,7 @@ from .._heat_utility import HeatUtility
 DataFrame = pd.DataFrame
 ExcelWriter = pd.ExcelWriter
 
-__all__ = ('stream_table', 'stream_tables', 
-           'cost_table', 'unit_reaction_tables',
+__all__ = ('stream_table', 'cost_table', 'unit_reaction_tables',
            'unit_result_tables', 'heat_utility_tables',
            'power_utility_table', 'tables_to_excel', 'voc_table',
            'other_utilities_table', 
@@ -71,7 +70,6 @@ def voc_table(systems, product_IDs, system_names=None, unit='MT', with_products=
     # Not ready for users yet
     isa = isinstance
     if isa(systems, bst.System): systems = [systems]
-    if isa(product_IDs, str): product_IDs = [product_IDs]
     inlet_cost_dct = {}
     outlet_revenue_dct = {}
     prices = bst.stream_prices
@@ -296,8 +294,8 @@ def lca_displacement_allocation_table(systems, key, items,
         except: continue
         for item in process_impact_items:
             if item.name not in process_inventory: process_inventory.append(item.name)
+            value = item.impact()
             CF = item.CF
-            value = item.impact() * CF
             basis = item.basis
             if basis != 'kg':
                 CF = f"{CF} [{impact_units}/{basis}"
@@ -313,10 +311,10 @@ def lca_displacement_allocation_table(systems, key, items,
     feeds = sorted({i.ID for i in sum([i.feeds for i in systems], []) if key in i.characterization_factors})
     coproducts = sorted({i.ID for i in sum([i.products for i in systems], []) if key in i.characterization_factors})
     system_heat_utilities = [bst.HeatUtility.sum_by_agent(sys.heat_utilities) for sys in systems]
-    input_heating_agents = sorted(set(sum([[i.agent.ID for i in hus if (i.agent.ID, key) in i.characterization_factors and i.flow * i.duty > 0. and i.flow > 1e-6] for hus in system_heat_utilities], [])))
-    input_cooling_agents = sorted(set(sum([[i.agent.ID for i in hus if (i.agent.ID, key) in i.characterization_factors and i.flow * i.duty < 0. and i.flow > 1e-6] for hus in system_heat_utilities], [])))
-    output_heating_agents = sorted(set(sum([[i.agent.ID for i in hus if (i.agent.ID, key) in i.characterization_factors and i.flow * i.duty > 0. and i.flow < -1e-6] for hus in system_heat_utilities], [])))
-    output_cooling_agents = sorted(set(sum([[i.agent.ID for i in hus if (i.agent.ID, key) in i.characterization_factors and i.flow * i.duty < 0. and i.flow < -1e-6] for hus in system_heat_utilities], [])))
+    input_heating_agents = sorted(set(sum([[i.agent.ID for i in hus if (key, i.agent.ID) in i.characterization_factors and i.flow * i.duty > 0. and i.flow > 1e-6] for hus in system_heat_utilities], [])))
+    input_cooling_agents = sorted(set(sum([[i.agent.ID for i in hus if (key, i.agent.ID) in i.characterization_factors and i.flow * i.duty < 0. and i.flow > 1e-6] for hus in system_heat_utilities], [])))
+    output_heating_agents = sorted(set(sum([[i.agent.ID for i in hus if (key, i.agent.ID) in i.characterization_factors and i.flow * i.duty > 0. and i.flow < -1e-6] for hus in system_heat_utilities], [])))
+    output_cooling_agents = sorted(set(sum([[i.agent.ID for i in hus if (key, i.agent.ID) in i.characterization_factors and i.flow * i.duty < 0. and i.flow < -1e-6] for hus in system_heat_utilities], [])))
     inputs = [*feeds, *input_heating_agents, *input_cooling_agents, *other_utilities]
     outputs = [*coproducts, *other_byproducts, *output_heating_agents, *output_cooling_agents]
     keys = [*inputs, 'Total inputs', *outputs, 'Total outputs displaced', *process_inventory, 'Total']
@@ -701,20 +699,6 @@ def other_utilities_table(units):
 #         tables.append(df)
 
 # %% Streams
-
-def stream_tables(streams, **stream_properties):
-    streams_by_chemicals = {}
-    stream_tables = []
-    for i in streams:
-        if not i: continue
-        chemicals = i.chemicals
-        if chemicals in streams_by_chemicals:
-            streams_by_chemicals[chemicals].append(i)
-        else:
-            streams_by_chemicals[chemicals] = [i]
-    for chemicals, streams in streams_by_chemicals.items():
-        stream_tables.append(stream_table(streams, chemicals=chemicals, T='K', **stream_properties))
-    return stream_tables
 
 def stream_table(streams, flow='kg/hr', percent=True, chemicals=None, **props):
     """

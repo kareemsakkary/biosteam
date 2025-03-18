@@ -107,27 +107,25 @@ class Configuration:
                 if getattr(i, 'decoupled', False): i.run()
                 i._update_nonlinearities()
     
-    def solve_material_flows(self, composition_sensitive=False):
-        if composition_sensitive:
-            if self.composition_sensitive_path:
-                for i in self.composition_sensitive_path: i._update_composition_parameters()
-                flows = self._solve_material_flows(composition_sensitive=True)
-                # for i in range(20):
-                #     for i in self.composition_sensitive_path: i._update_composition_parameters()
-                #     self._solve_material_flows(composition_sensitive=True)
-                def update_inner_material_balance_parameters(flows):
-                    for i in self.composition_sensitive_path: i._update_composition_parameters()
-                    return self._solve_material_flows(composition_sensitive=True)
-                
-                flx.fixed_point(
-                    update_inner_material_balance_parameters,
-                    flows, xtol=tmo.LLE.pseudo_equilibrium_inner_loop_options['xtol'] * flows.max(), 
-                    maxiter=10, checkiter=False,
-                    checkconvergence=False,
-                )
-                for i in self.composition_sensitive_path: i._update_net_flow_parameters()
-        else:
-            self._solve_material_flows(composition_sensitive=False)
+    def solve_material_flows(self):
+        # if self.composition_sensitive_path:
+        #     for i in self.composition_sensitive_path: i._update_composition_parameters()
+        #     flows = self._solve_material_flows(composition_sensitive=True)
+        #     # for i in range(20):
+        #     #     for i in self.composition_sensitive_path: i._update_composition_parameters()
+        #     #     self._solve_material_flows(composition_sensitive=True)
+        #     def update_inner_material_balance_parameters(flows):
+        #         for i in self.composition_sensitive_path: i._update_composition_parameters()
+        #         return self._solve_material_flows(composition_sensitive=True)
+            
+        #     flx.fixed_point(
+        #         update_inner_material_balance_parameters,
+        #         flows, xtol=tmo.LLE.pseudo_equilibrium_inner_loop_options['xtol'] * flows.max(), 
+        #         maxiter=20, checkiter=False,
+        #         checkconvergence=False,
+        #     )
+        #     for i in self.composition_sensitive_path: i._update_net_flow_parameters()
+        self._solve_material_flows(composition_sensitive=False)
     
     def dynamic_coefficients(self, b):
         try:
@@ -144,6 +142,7 @@ class Configuration:
             nodes = self.composition_sensitive_nodes
         else:
             nodes = self.nodes
+        streams = self.stream_ref
         A = []
         b = []
         for node in nodes:
@@ -154,7 +153,7 @@ class Configuration:
                 except: raise e from None
             for coefficients, value in eqs:
                 coefficients = {
-                    i.material_reference: j for i, j in coefficients.items()
+                    streams[i.imol]: j for i, j in coefficients.items()
                 }
                 A.append(coefficients)
                 b.append(value)
@@ -171,11 +170,8 @@ class Configuration:
             b_ready = np.array([i[ready_index] for i in b], float)
             values = solve(A_ready, b_ready.T).T
             values[values < 0] = 0
-            for obj, value in zip(objs, values): # update material flows
-                indexer, phase = obj
-                index = indexer._phase_indexer(phase)
-                mol = indexer.data.rows[index]
-                mol[ready_index] = value
+            for obj, value in zip(objs, values): 
+                obj._update_material_flows(value, ready_index)
             A_delayed = [{i: j[delayed_index] for i, j in dct.items()} for dct in A]
             A_delayed, objs = dictionaries2array(A_delayed)
             b_delayed = np.array([
@@ -189,50 +185,10 @@ class Configuration:
         else:
             A, objs = dictionaries2array(A)
             values = solve(A, np.array(b).T).T
-            values[(values < 0) & (values > -1e-6)] = 0
-            masks = values < 0
-            if masks.any():
-                data_storage = []
-                for obj in objs:
-                    indexer, phase = obj
-                    index = indexer._phase_indexer(phase)
-                    data_storage.append(indexer.data.rows[index])
-                new_values = values[masks] 
-                old_values = SparseArray.from_rows(data_storage).to_array()
-                denominator = (old_values[masks] - new_values)
-                denominator[denominator == 0] = 1
-                weights = -new_values / denominator
-                relaxation_factor = weights.max()
-                values = relaxation_factor * old_values + (1 - relaxation_factor) * values
-                for mol, value in zip(data_storage, values): # update material flows
-                    mol[:] = value
-                # for obj, mask, value in zip(objs, masks, values): # update material flows
-                #     indexer, phase = obj
-                #     index = indexer._phase_indexer(phase)
-                #     mol = indexer.data.rows[index]
-                #     if mask.any():
-                #         new_mol = value[mask]
-                #         relaxation_factor = (-new_mol / (mol[mask] - new_mol)).max()
-                #         print(relaxation_factor)
-                #         mol[:] = relaxation_factor * mol + (1 - relaxation_factor) * value
-                #     else:
-                #         mol[:] = value
-            else:
-                for obj, value in zip(objs, values): # update material flows
-                    indexer, phase = obj
-                    index = indexer._phase_indexer(phase)
-                    mol = indexer.data.rows[index]
-                    mol[:] = value
-            # masks = values >= 0
-            # mask = (values < 0) & (values > -1e-9)
-            # if (values < 0).any(): 
-            #     raise RuntimeError('material balance could not be solved')
-            
-            # for obj, mask, value in zip(objs, masks, values): # update material flows
-            #     indexer, phase = obj
-            #     index = indexer._phase_indexer(phase)
-            #     mol = indexer.data.rows[index]
-            #     mol[mask] = value[mask]
+            mask = (values < 0) & (values > -1e-9)
+            values[mask] = 0
+            if (values < 0).any(): raise RuntimeError('material balance could not be solved')
+            for obj, value in zip(objs, values): obj._update_material_flows(value)
         for i in nodes: 
             if hasattr(i, '_update_auxiliaries'): i._update_auxiliaries()
         return values
@@ -249,7 +205,11 @@ class Configuration:
         departures = solve(A, np.array(b).T).T
         try:
             for obj, departure in zip(objs, departures): 
-                obj._update_energy_variable(departure)
+                try:
+                    obj._update_energy_variable(departure)
+                except:
+                    print(repr(obj))
+                    breakpoint()
         except AttributeError as e:
             if obj._update_energy_variable:
                 raise e
@@ -262,8 +222,8 @@ class Configuration:
         sinks = {}
         sources = {}
         for u in units:
-            ins = u.flat_ins
-            outs = u.flat_outs
+            ins = u.ins
+            outs = u.outs
             for i in ins: 
                 i._sink = u
                 sinks[i.imol] = u
@@ -1114,52 +1074,47 @@ class System:
             for unit in self.units: responses.extend(unit.responses)
             return responses
 
-    def parameter(self, 
-            setter: Optional[Callable]=None,
-            element: Optional[Unit]=None, 
-            coupled: Optional[bool]=None,
-            name: Optional[str]=None, 
-            distribution: Optional[str|object]=None, 
-            units: Optional[str]=None, 
-            baseline: Optional[float]=None, 
-            bounds: Optional[tuple[float, float]]=None, 
-            hook: Optional[Callable]=None, 
-            description: Optional[str]=None, 
-            optimized=False, 
-            kind=None, # For backwards compatibility
-        ):
+    def parameter(self, setter=None, element=None, kind=None, name=None, 
+                  distribution=None, units=None, baseline=None, bounds=None, 
+                  hook=None, description=None, scale=None):
         """
-        Define and register parameter.
+        Define parameter.
         
         Parameters
-        ---------*    
-        setter : 
-            Should set parameter in the element.
-        element : 
-            Element in the system being altered.
-        coupled : 
-            Whether parameter is coupled to the system's mass and energy balances.
-            This allows a ConvergenceModel to predict it's impact on recycle loops.
-            Defaults to False.
-        name : 
-            Name of parameter. If None, default to argument name of setter.
-        distribution : 
-            Parameter distribution.
-        units : 
-            Parameter units of measure
-        baseline : 
+        ----------    
+        setter : function
+                 Should set parameter in the element.
+        element : Unit or :class:`~thermosteam.Stream`
+                  Element in the system being altered.
+        kind : {'coupled', 'isolated', 'design', 'cost'}, optional
+            * 'coupled': parameter is coupled to the system.
+            * 'isolated': parameter does not affect the system but does affect the element (if any).
+            * 'design': parameter only affects design and/or cost of the element.
+        name : str, optional
+               Name of parameter. If None, default to argument name of setter.
+        distribution : chaospy.Dist
+                       Parameter distribution.
+        units : str, optional
+                Parameter units of measure
+        baseline : float, optional
             Baseline value of parameter.
-        bounds : 
+        bounds : tuple[float, float], optional
             Lower and upper bounds of parameter.
-        hook : 
+        hook : Callable, optional
             Should return the new parameter value given the sample.
+        scale : float, optional
+            The sample is multiplied by the scale before setting.
+        
+        Notes
+        -----
+        If kind is 'coupled', account for downstream operations. Otherwise,
+        only account for given element. If kind is 'design' or 'cost', 
+        element must be a Unit object.
         
         """
-        if kind == 'coupled': coupled = True
-        elif coupled is None: coupled = False
         if isinstance(setter, bst.Parameter):
             if element is None: element = setter.element
-            if coupled is None: coupled = setter.coupled
+            if kind is None: kind = setter.kind
             if name is None: name = setter.name
             if distribution is None: distribution = setter.distribution
             if units is None: units = setter.units
@@ -1167,19 +1122,19 @@ class System:
             if bounds is None: bounds = setter.bounds
             if hook is None: hook = setter.hook
             if description is None: description = setter.description
+            if scale is None: scale = setter.scale
             setter = setter.setter
         elif isinstance(setter, bst.MockFeature):
             if element is None: element = setter.element
             if name is None: name = setter.name
             if units is None: units = setter.units
         elif not setter:
-            return lambda setter: self.parameter(setter, element, coupled, name,
+            return lambda setter: self.parameter(setter, element, kind, name,
                                                  distribution, units, baseline,
-                                                 bounds, hook, description, optimized)
-        p = bst.Parameter(name, setter, element,
-                          self, distribution, units, 
-                          baseline, bounds, coupled, hook, description)
-        return p
+                                                 bounds, hook, description, scale)
+        return bst.Parameter(name, setter, element,
+                      self, distribution, units, 
+                      baseline, bounds, kind, hook, description, scale)
 
     def track_recycle(self, recycle: Stream, collector: list[Stream]=None):
         if not isinstance(recycle, Stream):
@@ -1201,8 +1156,7 @@ class System:
             units: Optional[Sequence[str]]=None,
             facility_recycle: Optional[Stream]=None,
         ):
-        old_IDs = [i.ID for i in self.subsystems]
-        # Warning: This method does not save the configuration.
+        # Warning: This method does not save the configuration
         if units is None: units = self.units
         self._delete_path_cache()
         isa = isinstance
@@ -1225,7 +1179,6 @@ class System:
             maxiter=self.maxiter,
             subsystems=True,
         )
-        for i, j in zip(self.subsystems, old_IDs): i.ID = j
 
     def __enter__(self):
         if self._path or self._recycle or self._facilities:
@@ -1263,23 +1216,13 @@ class System:
         if self.recycle:
             for i in self.units: 
                 i._system = i._recycle_system = self
-                if hasattr(i, 'stages'):
-                    for j in i.stages:
-                        j._system = j._recycle_system = self
         else:
             for i in self.units: 
                 i._system = self
                 i._recycle_system = None
-                if hasattr(i, 'stages'):
-                    for j in i.stages:
-                        j._system = self
-                        j._recycle_system = None
             for sys in self.subsystems: 
                 if sys.recycle: 
-                    for i in sys.units: 
-                        i._recycle_system = sys
-                        if hasattr(i, 'stages'):
-                            for j in i.stages: j._recycle_system = sys
+                    for i in sys.units: i._recycle_system = sys
 
     @ignore_docking_warnings
     def interface_property_packages(self):
@@ -1446,7 +1389,7 @@ class System:
         This method also works as a decorator.
 
         """
-        if not specification: return lambda specification: self.add_specification(specification, args, simulate)
+        if not specification: return lambda specification: self.add_specification(specification, args)
         if not callable(specification): raise ValueError('specification must be callable')
         self._specifications.append(SystemSpecification(specification, args))
         if simulate is not None: self.simulate_after_specifications = simulate
@@ -2143,35 +2086,24 @@ class System:
         system._ID = f'{type(unit).__name__}-{unit} and downstream'
         return system
 
-    def _minimal_digraph(self, facilities, graph_attrs):
+    def _minimal_digraph(self, graph_attrs):
         """Return digraph of the path as a box."""
-        units = self.units
-        if not facilities: units = [i for i in units if not isinstance(i, bst.Facility)]
-        return minimal_digraph(self.ID, units, self.streams, **graph_attrs)
+        return minimal_digraph(self.ID, self.units, self.streams, **graph_attrs)
 
-    def _surface_digraph(self, facilities, graph_attrs):
-        units = self._path
-        if not facilities: units = [i for i in units if not isinstance(i, bst.Facility)]
-        return surface_digraph(units, **graph_attrs)
+    def _surface_digraph(self, graph_attrs):
+        return surface_digraph(self._path, **graph_attrs)
 
-    def _thorough_digraph(self, facilities, graph_attrs):
-        units = self.unit_path
-        if not facilities: units = [i for i in units if not isinstance(i, bst.Facility)]
-        return digraph_from_units(units, self.streams, **graph_attrs)
+    def _thorough_digraph(self, graph_attrs):
+        return digraph_from_units(self.unit_path, self.streams, **graph_attrs)
 
-    def _cluster_digraph(self, facilities, graph_attrs):
-        path = (*self.path, *self.facilities) if facilities else self.path
-        return digraph_from_system(self, path, **graph_attrs)
-
-    def _stage_digraph(self, graph_attrs):
-        with self.stage_configuration(aggregated=False) as conf:
-            return digraph_from_units(conf.stages, conf.streams, **graph_attrs)
+    def _cluster_digraph(self, graph_attrs):
+        return digraph_from_system(self, **graph_attrs)
 
     def diagram(self, kind: Optional[int|str]=None, file: Optional[str]=None, 
                 format: Optional[str]=None, display: Optional[bool]=True,
                 number: Optional[bool]=None, profile: Optional[bool]=None,
                 label: Optional[bool]=None, title: Optional[str]=None,
-                auxiliaries: Optional[bool]=None, facilities: Optional[bool]=True,
+                auxiliaries: Optional[bool]=None,
                 **graph_attrs):
         """
         Display a `Graphviz <https://pypi.org/project/graphviz/>`__ diagram of
@@ -2181,10 +2113,9 @@ class System:
         ----------
         kind :
             * 0 or 'cluster': Display all units clustered by system.
-            * 1 or 'thorough': Display every unit within the system.
+            * 1 or 'thorough': Display every unit within the path.
             * 2 or 'surface': Display only elements listed in the path.
-            * 3 or 'minimal': Display a single box representing the system.
-            * 4 or 'stage': Display every stage within the system.
+            * 3 or 'minimal': Display a single box representing all units.
         file : 
             File name to save diagram. 
         format:
@@ -2215,15 +2146,13 @@ class System:
             if profile is not None: preferences.profile = profile
             if format is not None: preferences.graphviz_format = format
             if kind == 0 or kind == 'cluster':
-                f = self._cluster_digraph(facilities, graph_attrs)
+                f = self._cluster_digraph(graph_attrs)
             elif kind == 1 or kind == 'thorough':
-                f = self._thorough_digraph(facilities, graph_attrs)
+                f = self._thorough_digraph(graph_attrs)
             elif kind == 2 or kind == 'surface':
-                f = self._surface_digraph(facilities, graph_attrs)
+                f = self._surface_digraph(graph_attrs)
             elif kind == 3 or kind == 'minimal':
-                f = self._minimal_digraph(facilities, graph_attrs)
-            elif kind == 4 or kind == 'stage':
-                f = self._stage_digraph(facilities, graph_attrs)
+                f = self._minimal_digraph(graph_attrs)
             else:
                 raise ValueError("kind must be one of the following: "
                                  "0 or 'cluster', 1 or 'thorough', 2 or 'surface', "
@@ -2236,10 +2165,9 @@ class System:
                         return 'unit'
                     elif N < 6:
                         return 'system'
-                    elif N < 9:
-                        return 'big-system'
                     else:
-                        return 'huge-system'
+                        return 'big-system'
+                    return True
                 height = (
                     preferences.graphviz_html_height
                     [size_key(self.units)]
@@ -2415,6 +2343,7 @@ class System:
                 self._setup_units()
                 self._remove_temporary_units()
                 self._save_configuration()
+                self._load_stream_links()
             else:
                 self._setup_units()
         self._load_facilities()
@@ -2459,25 +2388,24 @@ class System:
                 return self._stage_configuration
         except:
             stages = self.stages
-            streams = list(set([i for s in stages for i in (*s.flat_ins, *s.flat_outs)]))
+            streams = list(set([i for s in stages for i in s.ins + s.outs]))
             connections = [(i, i.source, i.sink) for i in streams]
             if aggregated:
                 stages = self.aggregated_stages
-                streams = [i for u in stages for i in u.flat_ins + u.flat_outs]
-                stream_ref = {i.material_reference: i for u in stages for i in (*u.flat_ins, *u.flat_outs)}
+                streams = [i for u in stages for i in u.ins + u.outs]
+                stream_ref = {i.imol: i for u in stages for i in (*u.ins, *u.outs)}
                 nodes = [i for i in stages if not getattr(i, 'decoupled', False)]
                 self._aggregated_stage_configuration = conf = Configuration(
                     self.path, stages, nodes, streams, stream_ref, connections, aggregated
                 )
             else:
-                stream_ref = {i.material_reference: i for i in streams}
+                stream_ref = {i.imol: i for i in streams}
                 nodes = [i for i in stages if not getattr(i, 'decoupled', False)]
                 self._stage_configuration = conf = Configuration(
                     self.path, stages, nodes, streams, stream_ref, connections, aggregated
                 )
             return conf
-        
-    # c = [0]
+    
     def run_phenomena(self):
         """Decouple and linearize material, equilibrium, summation, enthalpy,
         and reaction phenomena and iteratively solve them."""
@@ -2488,18 +2416,13 @@ class System:
                     if isinstance(i, (bst.Mixer, bst.Splitter)) and not i.specifications: continue
                     i.run()
                     conf.solve_energy_departures()
-                    conf._solve_material_flows(composition_sensitive=False)
+                    conf.solve_material_flows()
                 conf.solve_nonlinearities()
-                conf.solve_material_flows(composition_sensitive=True)
                 conf.solve_energy_departures()
-                conf._solve_material_flows(composition_sensitive=False)
-            except (NotImplementedError, UnboundLocalError, TypeError, KeyError) as error:
+                conf.solve_material_flows()
+            except (NotImplementedError, UnboundLocalError, TypeError) as error:
                 raise error
             except:
-            # except Exception as e:
-                # if self.c[0] != 0: raise e
-                # self.c[0] += 1
-                # print('failed!')
                 for i in path: i.run()
             
     def _solve(self):
@@ -2831,14 +2754,9 @@ class System:
                             kwargs=kwargs,
                         )
                         for ss in specifications: ss()
-                        try: 
-                            outputs = self._simulation_outputs
-                        except AttributeError:
-                            outputs = None
-                        else:
-                            del self._simulation_outputs
-                        finally:
-                            del self._simulation_default_arguments
+                        outputs = self._simulation_outputs
+                        del self._simulation_default_arguments
+                        del self._simulation_outputs
                 finally:
                     self._running_specifications = False
             else:
@@ -3513,14 +3431,7 @@ class System:
             return series
 
     # Report summary
-    def save_report(
-            self, 
-            file: Optional[str]='report.xlsx', 
-            dpi: Optional[str]='900', 
-            sheets=None,
-            stage=False,
-            **stream_properties
-        ): 
+    def save_report(self, file: Optional[str]='report.xlsx', dpi: Optional[str]='900', **stream_properties): 
         """
         Save a system report as an xlsx file.
         
@@ -3534,108 +3445,83 @@ class System:
             Additional stream properties and units as key-value pairs (e.g. T='degC', flow='gpm', H='kW', etc..)
             
         """
-        if sheets is None:
-            sheets = {
-                'Flowsheet',
-                'Itemized costs',
-                'Stream table',
-                'Utilities',
-                'Design requirements',
-                'Reactions',
-                # 'Specifications'
-            }
         writer = pd.ExcelWriter(file)
         units = sorted(self.units, key=lambda x: x.line)
         cost_units = [i for i in units if i._design or i._cost]
-        if 'Flowsheet' in sheets:
+        try:
+            with bst.preferences.temporary() as p:
+                p.reset()
+                p.light_mode()
+                self.diagram('thorough', file='flowsheet', dpi=str(dpi), format='png')
+        except:
+            diagram_completed = False
+            warn(RuntimeWarning('failed to generate diagram through graphviz'), stacklevel=2)
+        else:
+            import PIL.Image
             try:
-                with bst.preferences.temporary() as p:
-                    p.reset()
-                    p.light_mode()
-                    kind = 'stage' if stage else 'thorough'
-                    self.diagram(kind, file='flowsheet', dpi=str(dpi), format='png')
+                # Assume openpyxl is used
+                worksheet = writer.book.create_sheet('Flowsheet')
+                flowsheet = openpyxl.drawing.image.Image('flowsheet.png')
+                worksheet.add_image(flowsheet, anchor='A1')
+            except PIL.Image.DecompressionBombError:
+                PIL.Image.MAX_IMAGE_PIXELS = int(1e9)
+                flowsheet = openpyxl.drawing.image.Image('flowsheet.png')
+                worksheet.add_image(flowsheet, anchor='A1')
             except:
-                diagram_completed = False
-                warn(RuntimeWarning('failed to generate diagram through graphviz'), stacklevel=2)
-            else:
-                import PIL.Image
+                # Assume xlsx writer is used
                 try:
-                    # Assume openpyxl is used
-                    worksheet = writer.book.create_sheet('Flowsheet')
-                    flowsheet = openpyxl.drawing.image.Image('flowsheet.png')
-                    worksheet.add_image(flowsheet, anchor='A1')
-                except PIL.Image.DecompressionBombError:
-                    PIL.Image.MAX_IMAGE_PIXELS = int(1e9)
-                    flowsheet = openpyxl.drawing.image.Image('flowsheet.png')
-                    worksheet.add_image(flowsheet, anchor='A1')
+                    worksheet = writer.book.add_worksheet('Flowsheet')
                 except:
-                    # Assume xlsx writer is used
-                    try:
-                        worksheet = writer.book.add_worksheet('Flowsheet')
-                    except:
-                        warn("problem in saving flowsheet; please submit issue to BioSTEAM with"
-                             "your current version of openpyxl and xlsx writer", RuntimeWarning)
-                    worksheet.insert_image('A1', 'flowsheet.png')
-                diagram_completed = True
+                    warn("problem in saving flowsheet; please submit issue to BioSTEAM with"
+                         "your current version of openpyxl and xlsx writer", RuntimeWarning)
+                worksheet.insert_image('A1', 'flowsheet.png')
+            diagram_completed = True
         
-        if 'Itemized costs' in sheets:
+        tea = self.TEA
+        if tea:
             tea = self.TEA
-            if tea:
-                tea = self.TEA
-                cost = report.cost_table(tea)
-                cost.to_excel(writer, 'Itemized costs')
-                tea.get_cashflow_table().to_excel(writer, 'Cash flow')
+            cost = report.cost_table(tea)
+            cost.to_excel(writer, 'Itemized costs')
+            tea.get_cashflow_table().to_excel(writer, 'Cash flow')
+        else:
+            warn(f'Cannot find TEA object in {repr(self)}. Ignoring TEA sheets.',
+                 RuntimeWarning, stacklevel=2)
+        
+        # Stream tables
+        # Organize streams by chemicals first
+        streams_by_chemicals = {}
+        for i in self.streams:
+            if not i: continue
+            chemicals = i.chemicals
+            if chemicals in streams_by_chemicals:
+                streams_by_chemicals[chemicals].append(i)
             else:
-                warn(f'Cannot find TEA object in {repr(self)}. Ignoring TEA sheets.',
-                     RuntimeWarning, stacklevel=2)
+                streams_by_chemicals[chemicals] = [i]
+        stream_tables = []
+        for chemicals, streams in streams_by_chemicals.items():
+            stream_tables.append(report.stream_table(streams, chemicals=chemicals, T='K', **stream_properties))
+        report.tables_to_excel(stream_tables, writer, 'Stream table')
         
-        if 'Stream table' in sheets:
-            if stage:
-                with self.stage_configuration() as conf:
-                    stream_tables = report.stream_tables(conf.streams, **stream_properties)
-            else:
-                stream_tables = report.stream_tables(self.streams, **stream_properties)
-            report.tables_to_excel(stream_tables, writer, 'Stream table')
+        # Heat utility tables
+        heat_utilities = report.heat_utility_tables(cost_units)
+        n_row = report.tables_to_excel(heat_utilities, writer, 'Utilities')
         
-        if 'Utilities' in sheets:
-            # Heat utility tables
-            heat_utilities = report.heat_utility_tables(cost_units)
-            n_row = report.tables_to_excel(heat_utilities, writer, 'Utilities')
+        # Power utility table
+        power_utility = report.power_utility_table(cost_units)
+        n_row = report.tables_to_excel([power_utility], writer, 'Utilities', n_row=n_row)
         
-            # Power utility table
-            power_utility = report.power_utility_table(cost_units)
-            n_row = report.tables_to_excel([power_utility], writer, 'Utilities', n_row=n_row)
-            
-            # Fees table
-            other_utilities = report.other_utilities_table(cost_units)
-            n_row = report.tables_to_excel(other_utilities, writer, 'Utilities', n_row=n_row)
+        # Fees table
+        other_utilities = report.other_utilities_table(cost_units)
+        n_row = report.tables_to_excel(other_utilities, writer, 'Utilities', n_row=n_row)
         
-        if 'Design requirements' in sheets:
-            # General desing requirements
-            results = report.unit_result_tables(cost_units)
-            report.tables_to_excel(results, writer, 'Design requirements')
+        # General desing requirements
+        results = report.unit_result_tables(cost_units)
+        report.tables_to_excel(results, writer, 'Design requirements')
         
-        if 'Reactions' in sheets:
-            # Reaction tables
-            reactions = report.unit_reaction_tables(units)
-            report.tables_to_excel(reactions, writer, 'Reactions')
+        # Reaction tables
+        reactions = report.unit_reaction_tables(units)
+        report.tables_to_excel(reactions, writer, 'Reactions')
         
-        if 'Specifications' in sheets:
-            if stage:
-                with self.stage_configuration() as conf:
-                    specifications = [
-                        u._mass_and_energy_balance_specifications_table()
-                        for u in conf.stages
-                    ]
-            else:
-                specifications = [
-                    u._mass_and_energy_balance_specifications_table()
-                    for u in units
-                ]
-            report.tables_to_excel(
-                specifications, writer, 
-                'Specifications'
-            )
         writer.close()
         if diagram_completed: os.remove("flowsheet.png")
 

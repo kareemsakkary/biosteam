@@ -8,19 +8,6 @@
 """
 General functional algorithms for the design of heat exchangers.
 
-References
-----------
-.. [1] Seider, W. D., Lewin,  D. R., Seader, J. D., Widagdo, S., Gani, R.,
-    & Ng, M. K. (2017). Product and Process Design Principles. Wiley.
-
-.. [2] Fakheri, Ahmad. "A General Expression for the Determination of the 
-   Log Mean Temperature Correction Factor for Shell and Tube Heat 
-   Exchangers." Journal of Heat Transfer 125, no. 3 (May 20, 2003): 527-30.
-   doi:10.1115/1.1571078.
-
-.. [3] Hall, Stephen. Rules of Thumb for Chemical Engineers, Fifth Edition.
-   Oxford; Waltham, MA: Butterworth-Heinemann, 2012.
-
 """
 from numpy import log as ln
 from numba import njit
@@ -203,7 +190,7 @@ def heuristic_overall_heat_transfer_coefficient(ci, hi, co, ho):
     """
     Return a heuristic estimate of the overall heat transfer coefficient
     [U; in kW/m^2/K]. Assume `U` is 1.0 kW/m^2/K if heat exchange is between
-    a condensing fluid and a vaporizing fluid and 0.5 kW/m^2/K otherwise [1]_.
+    a condensing fluid and a vaporizing fluid and 1.0 kW/m^2/K otherwise.
     
     Parameters
     ----------
@@ -237,7 +224,7 @@ def heuristic_pressure_drop(inlet_vapor_fraction, outlet_vapor_fraction):
     """
     Return a heuristic estimate of the pressure drop [dP; in psi]. If the fluid 
     changes phase, `dP` is 1.5 psi. If the fluid remains a liquid, `dP` is 5 psi.
-    If the fluid remains a gas, `dP` is 3 psi [1]_.
+    If the fluid remains a gas, `dP` is 3 psi.
     
     Parameters
     ----------
@@ -264,7 +251,7 @@ def heuristic_pressure_drop(inlet_vapor_fraction, outlet_vapor_fraction):
 def heuristic_tubeside_and_shellside_pressure_drops(ci, hi, co, ho,
                                                     tubeside_iscooling=True):
     """
-    Return an estimate of tubeside and shellside pressure drops  [1]_.
+    Return an estimate of tubeside and shellside pressure drops.
     
     Parameters
     ----------
@@ -357,7 +344,7 @@ def compute_Fahkeri_LMTD_correction_factor(Tci, Thi, Tco, Tho, N_shells):
     Return the log-mean temperature difference correction factor `Ft` 
     for a shell-and-tube heat exchanger with one or an even number of tube 
     passes, and a given number of shell passes, with the expression given in 
-    [2]_ and also shown in [3]_.
+    [1]_ and also shown in [2]_.
     
     .. math::
         F_t=\frac{S\ln W}{\ln \frac{1+W-S+SW}{1+W+S-SW}}
@@ -406,6 +393,15 @@ def compute_Fahkeri_LMTD_correction_factor(Tci, Thi, Tco, Tho, N_shells):
     --------
     compute_Fahkeri_LMTD_correction_factor(Tci=15, Tco=85, Thi=130, Tho=110, N_shells=1)
     0.9438358829645933
+    
+    References
+    ----------
+    .. [1] Fakheri, Ahmad. "A General Expression for the Determination of the 
+       Log Mean Temperature Correction Factor for Shell and Tube Heat 
+       Exchangers." Journal of Heat Transfer 125, no. 3 (May 20, 2003): 527-30.
+       doi:10.1115/1.1571078.
+    .. [2] Hall, Stephen. Rules of Thumb for Chemical Engineers, Fifth Edition.
+       Oxford; Waltham, MA: Butterworth-Heinemann, 2012.
     
     """
     if (Tco - Tci) < 0.01:

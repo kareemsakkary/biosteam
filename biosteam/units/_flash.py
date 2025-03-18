@@ -331,7 +331,6 @@ class Flash(design.PressureVessel, Unit):
     def _design_parameters(self):
         # Retrieve run_args and properties
         vap, liq, *_ = self._outs
-        if self.has_vapor_condenser: vap = self.vapor_condenser.outs[0]
         rhov = vap.get_property('rho', 'lb/ft3')
         rhol = liq.get_property('rho', 'lb/ft3')
         P = liq.get_property('P', 'psi')  # Pressure (psi)
@@ -669,11 +668,7 @@ class Evaporator(Flash):
                 elif V > 1:
                     vapor.imol[chemical_ID] = f
                     liquid.imol[chemical_ID] = 0
-                    try:
-                        vapor.H = H
-                    except RuntimeError: # Extrapolation failed
-                        vapor.phase = 'g'
-                        vapor.T = vapor.chemicals[chemical_ID].Tc
+                    vapor.H = H
                 else:
                     vapor.imol[chemical_ID] = f * V
                     liquid.imol[chemical_ID] = (1 - V) * f

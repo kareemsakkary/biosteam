@@ -13,9 +13,6 @@ References
 .. [2] Benz, G. T. Bioreactor Design for Chemical Engineers. Chem. Eng.\
     Progress 2011, 21–26.
 
-.. [3] Seider, W. D., Lewin,  D. R., Seader, J. D., Widagdo, S., Gani, R.,
-    & Ng, M. K. (2017). Product and Process Design Principles. Wiley.
-
 """
 import biosteam as bst
 from .stirred_tank_reactor import AbstractStirredTankReactor
@@ -98,14 +95,8 @@ class AeratedBioreactor(AbstractStirredTankReactor):
     def _init(
             self, reactions, theta_O2=0.5, Q_O2_consumption=None,
             optimize_power=None, design=None, method=None, kLa_kwargs=None,
-            cooler_pressure_drop=None, compressor_isentropic_efficiency=None,
             **kwargs,
         ):
-        if compressor_isentropic_efficiency is None: compressor_isentropic_efficiency = 0.85
-        #: Isentropic efficiency of the compressor. Defaults to 0.85.
-        self.compressor_isentropic_efficiency = compressor_isentropic_efficiency 
-        #: Pressure drop at the cooler [Pa]. Defaults to 20684.28 Pa, a heuristic value for a gas.
-        self.cooler_pressure_drop = 20684.28 if cooler_pressure_drop is None else cooler_pressure_drop
         AbstractStirredTankReactor._init(self, **kwargs)
         self.reactions = reactions
         self.theta_O2 = theta_O2 # Average concentration of O2 in the liquid as a fraction of saturation.
@@ -205,12 +196,10 @@ class AeratedBioreactor(AbstractStirredTankReactor):
     def load_auxiliaries(self):
         super().load_auxiliaries()
         compressor = self.auxiliary(
-            'compressor', bst.IsentropicCompressor, 
-            self.air, eta=self.compressor_isentropic_efficiency, P=2 * 101325,
+            'compressor', bst.IsentropicCompressor, self.air, eta=0.85, P=2 * 101325
         )
         self.auxiliary(
-            'air_cooler', bst.HXutility, compressor-0, T=self.T, 
-            dP=False, 
+            'air_cooler', bst.HXutility, compressor-0, T=self.T
         )
         
     def _run_vent(self, vent, effluent):
@@ -330,7 +319,7 @@ class AeratedBioreactor(AbstractStirredTankReactor):
         liquid.copy_thermal_condition(self.outs[0])
         self.effluent_density = rho = liquid.rho
         length = self.get_design_result('Length', 'm') * self.V_wf
-        return g * rho * length + 101325 + self.cooler_pressure_drop # Pa
+        return g * rho * length + 101325 # Pa
     
     def _design(self):
         AbstractStirredTankReactor._design(self)
@@ -598,7 +587,11 @@ class GasFedBioreactor(AbstractStirredTankReactor):
             vent.empty()
             self._run_vent(vent, effluent)
         
-        baseline_feed = bst.Stream.sum(self.normal_gas_feeds, energy_balance=False)
+        try:
+            baseline_feed = bst.Stream.sum(self.normal_gas_feeds, energy_balance=False)
+        except:
+            breakpoint()
+            bst.Stream.sum(self.normal_gas_feeds, energy_balance=False)
         baseline_flows = baseline_feed.get_flow('mol/s', self.gas_substrates)
         bounds = np.array([[max(1.01 * SURs[i] - baseline_flows[i], 0), 10 * SURs[i]] for i in index])
         if self.optimize_power:
@@ -621,9 +614,8 @@ class GasFedBioreactor(AbstractStirredTankReactor):
                 mask = STRs - F_ins > 0
                 STRs[mask] = F_ins[mask]
                 diff = SURs - STRs
-                diff[diff > 0] *= 1e3 # Force transfer rate to meet uptake rate
-                SE = (diff * diff).sum()
-                return SE
+                diff[diff > 0] *= 1e6 # Force transfer rate to meet uptake rate
+                return (diff * diff).sum()
             
             f = gas_flow_rate_objective
             with catch_warnings():
@@ -700,7 +692,7 @@ class GasFedBioreactor(AbstractStirredTankReactor):
         liquid.copy_thermal_condition(self.outs[0])
         self.effluent_density = rho = liquid.rho
         length = self.get_design_result('Length', 'm') * self.V_wf
-        return g * rho * length + 101325 + self.cooler_pressure_drop # Pa
+        return g * rho * length + 101325 # Pa
     
     def _design(self):
         AbstractStirredTankReactor._design(self)
